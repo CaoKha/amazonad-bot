@@ -1,5 +1,34 @@
+use std::fmt;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+/// Type of paid ad placement on Amazon search results.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PlacementType {
+    /// Inline search result marked "Sponsored" (sp-sponsored-result / AdHolder / label)
+    SponsoredProduct,
+    /// Carousel widget at bottom of results (multi-ad-feedback-form-trigger JSON)
+    SponsoredProductCarousel,
+    /// Headline banner at top of page — brand logo + headline + 2-3 products
+    SponsoredBrand,
+    /// Inline video ad with product info
+    SponsoredBrandVideo,
+    /// "Editorial recommendations" / "Recommandations éditoriales" section
+    EditorialRecommendation,
+}
+
+impl fmt::Display for PlacementType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SponsoredProduct => write!(f, "Sponsored Product"),
+            Self::SponsoredProductCarousel => write!(f, "SP Carousel"),
+            Self::SponsoredBrand => write!(f, "Sponsored Brand"),
+            Self::SponsoredBrandVideo => write!(f, "SB Video"),
+            Self::EditorialRecommendation => write!(f, "Editorial Pick"),
+        }
+    }
+}
 
 /// A single product from amazon.fr search results.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -10,6 +39,7 @@ pub struct SearchResult {
     pub page: u32,
     pub position_in_page: usize,
     pub is_sponsored: bool,
+    pub placement_type: Option<PlacementType>,
 }
 
 /// Outcome of scraping amazon.fr search results page.

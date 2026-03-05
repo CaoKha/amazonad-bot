@@ -6,7 +6,7 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 use crate::amazon_scraper::AmazonScraper;
-use mts_common::models::MonitorState;
+use mts_common::models::{MonitorState, PlacementType};
 use mts_common::state::StateManager;
 
 #[allow(dead_code)]
@@ -282,11 +282,11 @@ impl CommandListener {
             }
         };
 
-        let sponsored: Vec<(u32, usize, &str)> = scrape_result
+        let sponsored: Vec<(u32, usize, &str, Option<&PlacementType>)> = scrape_result
             .results
             .iter()
             .filter(|r| r.is_sponsored)
-            .map(|r| (r.page, r.position_in_page, r.title.as_str()))
+            .map(|r| (r.page, r.position_in_page, r.title.as_str(), r.placement_type.as_ref()))
             .collect();
 
         let new_state = MonitorState {
@@ -309,9 +309,10 @@ impl CommandListener {
         let truncated = sponsored.len().saturating_sub(20);
 
         let mut list = String::new();
-        for (page, pos, title) in &display_items {
-            let loc = if *pos == 0 { format!("Page {page} Carousel") } else { format!("Page {page} #{pos}") };
-            list.push_str(&format!("* {loc} - {}\n", escape_html(title)));
+        for (page, pos, title, pt) in &display_items {
+            let loc = if *pos == 0 { format!("Page {page} Top/Carousel") } else { format!("Page {page} #{pos}") };
+            let tag = pt.map(|t| format!(" [{t}]")).unwrap_or_default();
+            list.push_str(&format!("* {loc}{tag} - {}\n", escape_html(title)));
         }
         if truncated > 0 {
             list.push_str(&format!("... and {truncated} more "));
@@ -319,7 +320,7 @@ impl CommandListener {
 
         let mut brands: Vec<String> = sponsored
             .iter()
-            .filter_map(|(_, _, title)| {
+            .filter_map(|(_, _, title, _)| {
                 title.split_whitespace().next().map(|s| s.to_string())
             })
             .collect();
@@ -367,11 +368,11 @@ impl CommandListener {
         };
 
         let brand_lower = arg.to_lowercase();
-        let filtered: Vec<(u32, usize, &str)> = scrape_result
+        let filtered: Vec<(u32, usize, &str, Option<&PlacementType>)> = scrape_result
             .results
             .iter()
             .filter(|r| r.is_sponsored && r.title.to_lowercase().contains(&brand_lower))
-            .map(|r| (r.page, r.position_in_page, r.title.as_str()))
+            .map(|r| (r.page, r.position_in_page, r.title.as_str(), r.placement_type.as_ref()))
             .collect();
 
         if filtered.is_empty() {
@@ -384,9 +385,10 @@ impl CommandListener {
         let truncated = filtered.len().saturating_sub(20);
 
         let mut list = String::new();
-        for (page, pos, title) in &display_items {
-            let loc = if *pos == 0 { format!("Page {page} Carousel") } else { format!("Page {page} #{pos}") };
-            list.push_str(&format!("* {loc} - {}\n", escape_html(title)));
+        for (page, pos, title, pt) in &display_items {
+            let loc = if *pos == 0 { format!("Page {page} Top/Carousel") } else { format!("Page {page} #{pos}") };
+            let tag = pt.map(|t| format!(" [{t}]")).unwrap_or_default();
+            list.push_str(&format!("* {loc}{tag} - {}\n", escape_html(title)));
         }
         if truncated > 0 {
             list.push_str(&format!("... and {truncated} more "));
@@ -420,6 +422,7 @@ impl CommandListener {
             "chat_id": self.chat_id,
             "text": text,
             "parse_mode": "HTML",
+            "disable_web_page_preview": true,
         });
 
         match self.client.post(&url).json(&body).send().await {

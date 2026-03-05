@@ -1,4 +1,5 @@
 use crate::escape_html;
+use crate::models::PlacementType;
 
 use anyhow::{bail, Context, Result};
 use tracing::warn;
@@ -33,13 +34,16 @@ impl TelegramNotifier {
 
     pub async fn send_ad_appeared(
         &self,
-        positions: &[(u32, usize)],
+        positions: &[(u32, usize, Option<PlacementType>)],
         sample_title: &str,
-        all_sponsored: &[(u32, usize, String)],
+        all_sponsored: &[(u32, usize, String, Option<PlacementType>)],
     ) -> Result<()> {
         let pos_str = positions
             .iter()
-            .map(|(page, pos)| if *pos == 0 { format!("Page {page} Carousel") } else { format!("Page {page} #{pos}") })
+            .map(|(page, pos, pt)| {
+                let loc = format_location(*page, *pos);
+                if let Some(pt) = pt { format!("{loc} [{pt}]") } else { loc }
+            })
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -54,27 +58,23 @@ impl TelegramNotifier {
                 keyword = escape_html(&self.keyword),
             )
         } else {
-            let display_items = all_sponsored.iter().take(20).collect::<Vec<_>>();
-            let truncated = all_sponsored.len().saturating_sub(20);
-
             let mut sponsored_list = String::new();
-            for (page, pos, title) in &display_items {
-                let suffix = if positions.contains(&(*page, *pos)) { " \u{2713}" } else { "" };
-                let loc = if *pos == 0 { format!("Page {page} Carousel") } else { format!("Page {page} #{pos}") };
-                sponsored_list.push_str(&format!("• {loc} — {}{}\n", escape_html(title), suffix));
+            for (page, pos, title, pt) in all_sponsored {
+                let is_huawei = positions.iter().any(|(p, po, _)| p == page && *po == *pos);
+                let suffix = if is_huawei { " ✓" } else { "" };
+                let loc = format_location(*page, *pos);
+                let tag = pt.as_ref().map(|t| format!(" [{t}]")).unwrap_or_default();
+                sponsored_list.push_str(&format!("• {loc}{tag} — {}{suffix}\n", escape_html(title)));
             }
-            if truncated > 0 {
-                sponsored_list.push_str(&format!("... and {truncated} more"));
-            } else {
-                sponsored_list.pop(); // Remove trailing newline only if no truncation
-            }
-            
+            // Remove trailing newline
+            sponsored_list.pop();
+
             format!(
                 "\u{1f50d} <b>Huawei ad detected on <a href=\"{search_url}\">{search_url}</a></b>\n\
                  Keyword: <code>{keyword}</code>\n\
                  Position(s): <b>{pos_str}</b>\n\
                  Title: {}\n\n\
-                 \u{1f4cb} Sponsored products on page ({} total):\n{}",
+                 \u{1f4cb} All paid placements ({} total):\n{}",
                 escape_html(sample_title),
                 all_sponsored.len(),
                 sponsored_list,
@@ -100,15 +100,16 @@ impl TelegramNotifier {
     }
 
     async fn send_message(&self, text: &str) -> Result<()> {
-        // Safety net: truncate to 4000 chars if needed
-        let text = if text.len() > 4000 {
-            let mut end = 4000;
-            while !text.is_char_boundary(end) { end -= 1; }
-            &text[..end]
-        } else {
-            text
-        };
+        let chunks = split_message(text, 4000);
 
+        for chunk in &chunks {
+            self.send_single_message(chunk).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn send_single_message(&self, text: &str) -> Result<()> {
         let url = format!(
             "https://api.telegram.org/bot{}/sendMessage",
             self.bot_token
@@ -137,6 +138,120 @@ impl TelegramNotifier {
         }
 
         Ok(())
+    }
+}
 
+/// Format a page+position into a human-readable location string.
+fn format_location(page: u32, pos: usize) -> String {
+    if pos == 0 {
+        format!("Page {page} Top/Carousel")
+    } else {
+        format!("Page {page} #{pos}")
+    }
+}
+
+/// Split a message into chunks that fit within Telegram's character limit.
+/// Splits at newline boundaries when possible; falls back to char-boundary splits.
+fn split_message(text: &str, max_len: usize) -> Vec<String> {
+    if text.len() <= max_len {
+        return vec![text.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut remaining = text;
+
+    while !remaining.is_empty() {
+        if remaining.len() <= max_len {
+            chunks.push(remaining.to_string());
+            break;
+        }
+
+        // Find the safe byte boundary at max_len
+        let mut safe_end = max_len;
+        while !remaining.is_char_boundary(safe_end) {
+            safe_end -= 1;
+        }
+
+        // Try to split at the last newline within the safe range
+        let split_at = remaining[..safe_end]
+            .rfind('\n')
+            .map(|pos| pos + 1) // include the newline in the current chunk
+            .unwrap_or(safe_end); // no newline — split at char boundary
+
+        chunks.push(remaining[..split_at].to_string());
+        remaining = &remaining[split_at..];
+    }
+
+    chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_message_stays_single_chunk() {
+        let msg = "Hello world";
+        let chunks = split_message(msg, 100);
+        assert_eq!(chunks, vec!["Hello world"]);
+    }
+
+    #[test]
+    fn exact_limit_stays_single_chunk() {
+        let msg = "abcde";
+        let chunks = split_message(msg, 5);
+        assert_eq!(chunks, vec!["abcde"]);
+    }
+
+    #[test]
+    fn splits_at_newline_boundary() {
+        let msg = "line1\nline2\nline3\nline4";
+        // max_len=12 fits "line1\nline2\n" (12 chars)
+        let chunks = split_message(msg, 12);
+        assert_eq!(chunks, vec!["line1\nline2\n", "line3\nline4"]);
+    }
+
+    #[test]
+    fn splits_long_line_at_char_boundary() {
+        // No newlines — must split at char boundary
+        let msg = "abcdefghij"; // 10 chars
+        let chunks = split_message(msg, 4);
+        assert_eq!(chunks, vec!["abcd", "efgh", "ij"]);
+    }
+
+    #[test]
+    fn handles_multibyte_chars() {
+        // 'é' is 2 bytes in UTF-8
+        let msg = "aaébb"; // a(1) a(1) é(2) b(1) b(1) = 6 bytes
+        let chunks = split_message(msg, 3);
+        // Can't split inside 'é', so first chunk is "aa" (2 bytes)
+        assert_eq!(chunks[0], "aa");
+        assert_eq!(chunks[1], "éb");
+        assert_eq!(chunks[2], "b");
+    }
+
+    #[test]
+    fn empty_message_returns_single_empty_chunk() {
+        let chunks = split_message("", 100);
+        assert_eq!(chunks, vec![""]);
+    }
+
+    #[test]
+    fn realistic_telegram_split() {
+        // Simulate a long ad list message
+        let mut msg = String::from("📋 All paid placements (50 total):\n");
+        for i in 1..=50 {
+            msg.push_str(&format!("• Page 1 #{i} [Sponsored Product] — Some Product Title Here\n"));
+        }
+        let chunks = split_message(&msg, 4000);
+        // Should produce multiple chunks
+        assert!(chunks.len() >= 1);
+        // Every chunk should be within limit
+        for chunk in &chunks {
+            assert!(chunk.len() <= 4000, "Chunk too long: {} bytes", chunk.len());
+        }
+        // Reassembled content should equal original
+        let reassembled: String = chunks.concat();
+        assert_eq!(reassembled, msg);
     }
 }

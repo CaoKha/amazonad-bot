@@ -4,11 +4,11 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use rand::Rng;
-use scraper::{Html, Selector};
+use scraper::{Element, Html, Selector};
 use tracing::{debug, warn};
 
 use crate::config::ScraperConfig;
-use mts_common::models::{ScrapeResult, SearchResult};
+use mts_common::models::{PlacementType, ScrapeResult, SearchResult};
 
 pub struct AmazonScraper {
     config: Arc<ScraperConfig>,
@@ -254,6 +254,13 @@ impl AmazonScraper {
             Selector::parse(".puis-sponsored-label-text").unwrap());
         static FEEDBACK_SEL: LazyLock<Selector> = LazyLock::new(||
             Selector::parse(r#"span[data-action="multi-ad-feedback-form-trigger"]"#).unwrap());
+        // Sponsored Brands: headline banner / video ads
+        static SB_BRAND_LABEL_SEL: LazyLock<Selector> = LazyLock::new(||
+            Selector::parse(".sponsored-brand-label-info-desktop").unwrap());
+        static SB_VIDEO_SEL: LazyLock<Selector> = LazyLock::new(||
+            Selector::parse(r#"div[data-component-type="sbv-video"]"#).unwrap());
+        static TOP_SLOT_SEL: LazyLock<Selector> = LazyLock::new(||
+            Selector::parse(r#"span[data-component-type="s-top-slot"]"#).unwrap());
 
         let document = Html::parse_document(html);
         let brand_lower = brand_filter.to_lowercase();
@@ -337,6 +344,7 @@ impl AmazonScraper {
                 page,
                 position_in_page: pos_in_page,
                 is_sponsored,
+                placement_type: if is_sponsored { Some(PlacementType::SponsoredProduct) } else { None },
             });
         }
 
@@ -377,11 +385,104 @@ impl AmazonScraper {
                 page,
                 position_in_page: 0,
                 is_sponsored: true,
+                placement_type: Some(PlacementType::SponsoredProductCarousel),
             });
             widget_added += 1;
         }
         }
         debug!("parse page={} widget_carousel_added={}", page, widget_added);
+
+        // === Parse Sponsored Brands (headline banners at top of page) ===
+        let already_seen_sb: HashSet<String> = results.iter().map(|r| r.asin.clone()).collect();
+        let mut sb_added = 0usize;
+
+        // Method 1: Look for sponsored-brand-label-info-desktop in top slots
+        for top_slot in document.select(&TOP_SLOT_SEL) {
+            let has_brand_label = top_slot.select(&SB_BRAND_LABEL_SEL).next().is_some();
+            if !has_brand_label { continue; }
+            // Extract ASINs from links within the brand banner
+            for link in top_slot.select(&H2_SEL) {
+                // Find parent search result div with data-asin
+                // Sponsored Brands often have product cards with ASINs
+                let title_text = link.text().collect::<String>().trim().to_string();
+                if title_text.is_empty() { continue; }
+                // Try to find ASIN from nearby elements
+                if let Some(parent) = link.parent_element() {
+                    if let Some(asin) = find_asin_in_ancestors(&parent) {
+                        if !already_seen_sb.contains(&asin) {
+                            results.push(SearchResult {
+                                asin: asin.clone(),
+                                title: title_text,
+                                position: 0,
+                                page,
+                                position_in_page: 0,
+                                is_sponsored: true,
+                                placement_type: Some(PlacementType::SponsoredBrand),
+                            });
+                            sb_added += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Method 2: Look for sbv-video containers (Sponsored Brands Video)
+        for video_div in document.select(&SB_VIDEO_SEL) {
+            // SB Video containers typically have product info and ASIN
+            let asin = video_div.value().attr("data-asin")
+                .or_else(|| video_div.value().attr("data-csa-c-asin"))
+                .unwrap_or("").to_string();
+            if asin.is_empty() || already_seen_sb.contains(&asin) { continue; }
+            let title = video_div.select(&H2_SEL)
+                .next()
+                .map(|h| h.text().collect::<String>().trim().to_string())
+                .unwrap_or_default();
+            if title.is_empty() { continue; }
+            results.push(SearchResult {
+                asin,
+                title,
+                position: 0,
+                page,
+                position_in_page: 0,
+                is_sponsored: true,
+                placement_type: Some(PlacementType::SponsoredBrandVideo),
+            });
+            sb_added += 1;
+        }
+        debug!("parse page={} sponsored_brand_added={}", page, sb_added);
+
+        // === Parse Editorial Recommendations ===
+        // These sections contain "Editorial recommendations" or "Recommandations éditoriales"
+        let mut editorial_added = 0usize;
+        let all_seen: HashSet<String> = results.iter().map(|r| r.asin.clone()).collect();
+        for el in document.select(&RESULT_SEL) {
+            let asin = match el.value().attr("data-asin") {
+                Some(a) if !a.is_empty() && !all_seen.contains(a) => a.to_string(),
+                _ => continue,
+            };
+            // Check if this result is inside an editorial section
+            let full_text = el.text().collect::<String>();
+            let is_editorial = full_text.contains("Editorial recommendation")
+                || full_text.contains("Recommandation éditoriale")
+                || full_text.contains("Recommandations éditoriales")
+                || full_text.contains("editorial recommendation");
+            if !is_editorial { continue; }
+            let title = el.select(&H2_SEL)
+                .next()
+                .map(|h| h.text().collect::<String>().trim().to_string())
+                .unwrap_or_default();
+            results.push(SearchResult {
+                asin,
+                title,
+                position: 0,
+                page,
+                position_in_page: 0,
+                is_sponsored: true,
+                placement_type: Some(PlacementType::EditorialRecommendation),
+            });
+            editorial_added += 1;
+        }
+        debug!("parse page={} editorial_added={}", page, editorial_added);
 
         let huawei_sponsored: Vec<&SearchResult> = results
             .iter()
@@ -416,4 +517,28 @@ impl AmazonScraper {
             format!("{}/s?k={}&page={}", base.trim_end_matches('/'), encoded, page)
         }
     }
+}
+
+/// Walk up the DOM tree looking for an element with `data-asin` attribute.
+fn find_asin_in_ancestors(el: &scraper::ElementRef) -> Option<String> {
+    // Check the element itself
+    if let Some(asin) = el.value().attr("data-asin") {
+        if !asin.is_empty() { return Some(asin.to_string()); }
+    }
+    // Walk up parents (limited to 5 levels to avoid excessive traversal)
+    let mut node = el.parent();
+    for _ in 0..5 {
+        match node {
+            Some(n) => {
+                if let Some(element) = n.value().as_element() {
+                    if let Some(asin) = element.attr("data-asin") {
+                        if !asin.is_empty() { return Some(asin.to_string()); }
+                    }
+                }
+                node = n.parent();
+            }
+            None => break,
+        }
+    }
+    None
 }

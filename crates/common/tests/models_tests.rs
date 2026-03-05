@@ -1,4 +1,4 @@
-use mts_common::models::{MonitorState, SearchResult};
+use mts_common::models::{MonitorState, PlacementType, SearchResult};
 
 #[test]
 fn search_result_serialization() {
@@ -9,6 +9,7 @@ fn search_result_serialization() {
         page: 1,
         position_in_page: 3,
         is_sponsored: true,
+        placement_type: Some(PlacementType::SponsoredProduct),
     };
 
     let json = serde_json::to_string(&result).unwrap();
