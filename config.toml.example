@@ -1,8 +1,16 @@
 [scraper]
-keyword = "montre connectee"
+keywords = [
+    "montre connectee",
+    "smartwatch",
+    "montre intelligente",
+    "montre sport connectee",
+    "montre connectee femme",
+    "montre connectee homme",
+    "huawei watch",
+]
 marketplace_url = "https://www.amazon.fr"
-brand_filter = "huawei"
-pages = 3  # Number of search result pages to check (1-7)
+brand_filter    = "huawei"
+pages           = 3
 # chrome_executable = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 # (optional — auto-detected on macOS and Linux if not set)
 

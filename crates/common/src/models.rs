@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 
 use chrono::{DateTime, Utc};
@@ -30,8 +31,27 @@ impl fmt::Display for PlacementType {
     }
 }
 
+/// Badge displayed on a product in search results.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum BadgeType {
+    BestSeller,
+    AmazonChoice,
+    HighlyRated,
+}
+
+impl fmt::Display for BadgeType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BestSeller => write!(f, "🏆 Meilleur vendeur"),
+            Self::AmazonChoice => write!(f, "✅ Choix d'Amazon"),
+            Self::HighlyRated => write!(f, "⭐ Très bien noté"),
+        }
+    }
+}
+
+
 /// A single product from amazon.fr search results.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SearchResult {
     pub asin: String,
     pub title: String,
@@ -40,6 +60,12 @@ pub struct SearchResult {
     pub position_in_page: usize,
     pub is_sponsored: bool,
     pub placement_type: Option<PlacementType>,
+    pub price: Option<String>,
+    pub rating: Option<f32>,
+    pub review_count: Option<u32>,
+    pub is_prime: bool,
+    pub badge: Option<BadgeType>,
+    pub brand: Option<String>,
 }
 
 /// Outcome of scraping amazon.fr search results page.
@@ -51,13 +77,25 @@ pub struct ScrapeResult {
     pub scraped_at: DateTime<Utc>,
 }
 
-/// Persisted state (saved to state.json).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Per-keyword monitoring state, stored in MonitorState.keywords.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct KeywordState {
+    /// Whether the monitored brand's ad was visible in the last sweep.
+    pub brand_ad_visible: bool,
+    /// Positions where the brand's ads appeared: (page, position_in_page, placement_type).
+    pub brand_positions: Vec<(u32, usize, Option<PlacementType>)>,
+    /// When brand visibility last changed (appeared or disappeared).
+    pub last_changed: Option<DateTime<Utc>>,
+    /// When this keyword was last checked.
+    pub last_checked: Option<DateTime<Utc>>,
+    /// Full result set from the last sweep (cached for bot commands).
+    pub last_results: Vec<SearchResult>,
+}
+
+/// Top-level persisted state — one entry per monitored keyword.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MonitorState {
-    pub huawei_ad_visible: bool,
-    pub huawei_positions: Vec<usize>,
-    pub total_results_scraped: usize,
-    pub updated_at: DateTime<Utc>,
+    pub keywords: HashMap<String, KeywordState>,
 }
 
 /// What happened after a check cycle.

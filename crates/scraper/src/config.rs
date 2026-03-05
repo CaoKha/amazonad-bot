@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use serde::de::{self, Deserializer, SeqAccess, Visitor};
 use serde::Deserialize;
 
 pub use mts_common::config::{MonitoringConfig, TelegramConfig};
@@ -12,7 +13,8 @@ pub struct AppConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ScraperConfig {
-    pub keyword: String,
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub keywords: Vec<String>,
     pub marketplace_url: String,
     pub brand_filter: String,
     #[serde(default = "default_pages")]
@@ -41,8 +43,13 @@ pub fn load_config() -> Result<AppConfig> {
     if app_config.telegram.chat_id == 0 {
         bail!("telegram.chat_id must be set (got 0). See README for how to find your chat ID.");
     }
-    if app_config.scraper.keyword.is_empty() {
-        bail!("scraper.keyword must not be empty.");
+    if app_config.scraper.keywords.is_empty() {
+        bail!("scraper.keywords must contain at least one keyword.");
+    }
+    for kw in &app_config.scraper.keywords {
+        if kw.trim().is_empty() {
+            bail!("scraper.keywords must not contain empty or whitespace-only entries.");
+        }
     }
     if app_config.scraper.marketplace_url.is_empty() {
         bail!("scraper.marketplace_url must not be empty.");
@@ -64,4 +71,44 @@ pub fn load_config() -> Result<AppConfig> {
     }
 
     Ok(app_config)
+}
+
+/// Deserializes keywords from either a TOML array or an env var string.
+/// - TOML array: `keywords = ["a", "b"]` → `vec!["a", "b"]`
+/// - Env var string: `APP__SCRAPER__KEYWORDS=a,b` → `vec!["a", "b"]`
+/// - Env var single: `APP__SCRAPER__KEYWORDS=montre` → `vec!["montre"]`
+/// - Env var empty: `APP__SCRAPER__KEYWORDS=` → `vec![]`
+fn deserialize_string_or_vec<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct StringOrVec;
+
+    impl<'de> Visitor<'de> for StringOrVec {
+        type Value = Vec<String>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a string or array of strings")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
+            if v.is_empty() {
+                Ok(vec![])
+            } else if v.contains(',') {
+                Ok(v.split(',').map(|s| s.trim().to_string()).collect())
+            } else {
+                Ok(vec![v.to_string()])
+            }
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+            let mut vec = Vec::new();
+            while let Some(val) = seq.next_element()? {
+                vec.push(val);
+            }
+            Ok(vec)
+        }
+    }
+
+    deserializer.deserialize_any(StringOrVec)
 }
