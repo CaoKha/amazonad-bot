@@ -1,5 +1,5 @@
 use crate::escape_html;
-use crate::models::PlacementType;
+use crate::models::{BadgeType, PlacementType};
 
 use anyhow::{bail, Context, Result};
 use tracing::warn;
@@ -36,13 +36,13 @@ impl TelegramNotifier {
         &self,
         positions: &[(u32, usize, Option<PlacementType>)],
         sample_title: &str,
-        all_sponsored: &[(u32, usize, String, Option<PlacementType>)],
+        all_sponsored: &[(u32, usize, String, Option<PlacementType>, Option<String>, Option<f32>, Option<u32>, bool, Option<BadgeType>)],
     ) -> Result<()> {
         let pos_str = positions
             .iter()
             .map(|(page, pos, pt)| {
                 let loc = format_location(*page, *pos);
-                if let Some(pt) = pt { format!("{loc} [{pt}]") } else { loc }
+                if let Some(pt) = pt { format!("{loc} [{}]", abbreviate_placement(pt)) } else { loc }
             })
             .collect::<Vec<_>>()
             .join(", ");
@@ -59,12 +59,13 @@ impl TelegramNotifier {
             )
         } else {
             let mut sponsored_list = String::new();
-            for (page, pos, title, pt) in all_sponsored {
-                let is_huawei = positions.iter().any(|(p, po, _)| p == page && *po == *pos);
-                let suffix = if is_huawei { " ✓" } else { "" };
-                let loc = format_location(*page, *pos);
-                let tag = pt.as_ref().map(|t| format!(" [{t}]")).unwrap_or_default();
-                sponsored_list.push_str(&format!("• {loc}{tag} — {}{suffix}\n", escape_html(title)));
+            for (page, pos, title, pt, price, rating, review_count, is_prime, badge) in all_sponsored {
+                let is_brand_match = positions.iter().any(|(p, po, _)| p == page && *po == *pos);
+                sponsored_list.push_str(&format_product_line(
+                    *page, *pos, title, pt.as_ref(), is_brand_match,
+                    price.as_deref(), *rating, *review_count, *is_prime, badge.as_ref(),
+                ));
+                sponsored_list.push('\n');
             }
             // Remove trailing newline
             sponsored_list.pop();
@@ -148,6 +149,77 @@ fn format_location(page: u32, pos: usize) -> String {
     } else {
         format!("Page {page} #{pos}")
     }
+}
+
+/// Abbreviate a placement type to a short tag.
+fn abbreviate_placement(pt: &PlacementType) -> &'static str {
+    match pt {
+        PlacementType::SponsoredProduct => "SP",
+        PlacementType::SponsoredProductCarousel => "SPC",
+        PlacementType::SponsoredBrand => "SB",
+        PlacementType::SponsoredBrandVideo => "SBV",
+        PlacementType::EditorialRecommendation => "ED",
+    }
+}
+
+/// Format a single product line with enrichment data.
+fn format_product_line(
+    page: u32,
+    pos: usize,
+    title: &str,
+    pt: Option<&PlacementType>,
+    is_brand_match: bool,
+    price: Option<&str>,
+    rating: Option<f32>,
+    review_count: Option<u32>,
+    is_prime: bool,
+    badge: Option<&BadgeType>,
+) -> String {
+    let loc = format_location(page, pos);
+    
+    let mut segments: Vec<String> = Vec::new();
+    
+    // Placement type tag
+    if let Some(pt) = pt {
+        segments.push(format!("[{}]", abbreviate_placement(pt)));
+    }
+    
+    // Rating + review count
+    if let Some(r) = rating {
+        let rating_str = if let Some(count) = review_count {
+            format!("⭐{r} ({count})")
+        } else {
+            format!("⭐{r}")
+        };
+        segments.push(rating_str);
+    } else if let Some(count) = review_count {
+        segments.push(format!("({count})"));
+    }
+    
+    // Price
+    if let Some(p) = price {
+        segments.push(p.to_string());
+    }
+    
+    // Prime
+    if is_prime {
+        segments.push("Prime".to_string());
+    }
+    
+    // Badge
+    if let Some(b) = badge {
+        segments.push(b.to_string());
+    }
+    
+    let meta = if segments.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", segments.join(" | "))
+    };
+    
+    let suffix = if is_brand_match { " ✓" } else { "" };
+    
+    format!("• {loc}{meta} — {}{suffix}", escape_html(title))
 }
 
 /// Split a message into chunks that fit within Telegram's character limit.

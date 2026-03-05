@@ -8,7 +8,7 @@ use scraper::{Element, Html, Selector};
 use tracing::{debug, warn};
 
 use crate::config::ScraperConfig;
-use mts_common::models::{PlacementType, ScrapeResult, SearchResult};
+use mts_common::models::{BadgeType, PlacementType, ScrapeResult, SearchResult};
 
 pub struct AmazonScraper {
     config: Arc<ScraperConfig>,
@@ -20,8 +20,8 @@ impl AmazonScraper {
     }
 
     /// Returns the page-1 search URL (e.g. `https://www.amazon.fr/s?k=montre+connectee`).
-    pub fn search_url(&self) -> String {
-        Self::build_search_url(&self.config.marketplace_url, &self.config.keyword, 1)
+    pub fn search_url(&self, keyword: &str) -> String {
+        Self::build_search_url(&self.config.marketplace_url, keyword, 1)
     }
 
     fn find_chrome(config: &ScraperConfig) -> Result<std::path::PathBuf> {
@@ -55,13 +55,24 @@ impl AmazonScraper {
         bail!("Chrome/Chromium not found. Install Chrome or set chrome_executable in config.toml")
     }
 
-    pub async fn scrape_search_page(&self) -> Result<ScrapeResult> {
+    pub async fn scrape_search_page(&self, keyword: &str) -> Result<ScrapeResult> {
+        let (mut browser, handle) = self.launch_browser().await?;
+        let result = self.scrape_all_pages_with_browser(&browser, keyword).await;
+        browser.close().await.ok();
+        handle.await.ok();
+        result
+    }
+
+    /// Launch a Chrome browser for reuse across multiple scrape calls.
+    /// Returns the browser and a background handler task join handle.
+    /// Caller is responsible for calling `browser.close().await` and awaiting the handle.
+    pub async fn launch_browser(&self) -> Result<(chromiumoxide::Browser, tokio::task::JoinHandle<()>)> {
         use chromiumoxide::browser::{Browser, BrowserConfig};
         use futures::StreamExt;
 
         let chrome_path = Self::find_chrome(&self.config)?;
 
-        let (mut browser, mut handler) = tokio::time::timeout(
+        let (browser, mut handler) = tokio::time::timeout(
             std::time::Duration::from_secs(45),
             Browser::launch(
                 BrowserConfig::builder()
@@ -79,15 +90,10 @@ impl AmazonScraper {
             while handler.next().await.is_some() {}
         });
 
-        let result = self.do_scrape(&browser).await;
-
-        browser.close().await.ok();
-        handle.await.ok();
-
-        result
+        Ok((browser, handle))
     }
 
-    async fn do_scrape(&self, browser: &chromiumoxide::Browser) -> Result<ScrapeResult> {
+    pub async fn scrape_all_pages_with_browser(&self, browser: &chromiumoxide::Browser, keyword: &str) -> Result<ScrapeResult> {
         const MODERN_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
             AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
@@ -99,7 +105,7 @@ impl AmazonScraper {
         for page_num in 1..=self.config.pages {
             let url = Self::build_search_url(
                 &self.config.marketplace_url,
-                &self.config.keyword,
+                keyword,
                 page_num,
             );
             debug!("Scraping page {}/{}: {}", page_num, self.config.pages, url);
@@ -261,6 +267,13 @@ impl AmazonScraper {
             Selector::parse(r#"div[data-component-type="sbv-video"]"#).unwrap());
         static TOP_SLOT_SEL: LazyLock<Selector> = LazyLock::new(||
             Selector::parse(r#"span[data-component-type="s-top-slot"]"#).unwrap());
+        // Enrichment selectors
+        static PRICE_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse(".a-price .a-offscreen").unwrap());
+        static RATING_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("span.a-icon-alt").unwrap());
+        static REVIEW_COUNT_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("span.s-underline-text").unwrap());
+        static PRIME_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("i.a-icon-prime").unwrap());
+        static BADGE_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("span.a-badge-text").unwrap());
+        static BRAND_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("span.a-size-base.a-color-secondary").unwrap());
 
         let document = Html::parse_document(html);
         let brand_lower = brand_filter.to_lowercase();
@@ -337,6 +350,46 @@ impl AmazonScraper {
                 );
             }
 
+            // === Enrichment fields ===
+            let price = element.select(&PRICE_SEL).next()
+                .map(|el| el.text().collect::<String>().trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let rating = element.select(&RATING_SEL).next()
+                .and_then(|el| {
+                    let text = el.text().collect::<String>();
+                    // French format: "4,5 sur 5 étoiles"
+                    text.split_whitespace().next()
+                        .and_then(|s| s.replace(',', ".").parse::<f32>().ok())
+                });
+
+            let review_count = element.select(&REVIEW_COUNT_SEL).next()
+                .and_then(|el| {
+                    let text = el.text().collect::<String>();
+                    let digits: String = text.chars().filter(|c| c.is_ascii_digit()).collect();
+                    digits.parse::<u32>().ok()
+                });
+
+            let is_prime = element.select(&PRIME_SEL).next().is_some();
+
+            let badge = element.select(&BADGE_SEL).next()
+                .and_then(|el| {
+                    let text = el.text().collect::<String>();
+                    if text.contains("Meilleur vendeur") || text.contains("Best Seller") {
+                        Some(BadgeType::BestSeller)
+                    } else if text.contains("Choix d'Amazon") || text.contains("Amazon's Choice") {
+                        Some(BadgeType::AmazonChoice)
+                    } else if text.contains("Très bien noté") || text.contains("Highly rated") {
+                        Some(BadgeType::HighlyRated)
+                    } else {
+                        None
+                    }
+                });
+
+            let brand = element.select(&BRAND_SEL).next()
+                .map(|el| el.text().collect::<String>().trim().to_string())
+                .filter(|s| !s.is_empty());
+
             results.push(SearchResult {
                 asin,
                 title,
@@ -345,6 +398,12 @@ impl AmazonScraper {
                 position_in_page: pos_in_page,
                 is_sponsored,
                 placement_type: if is_sponsored { Some(PlacementType::SponsoredProduct) } else { None },
+                price,
+                rating,
+                review_count,
+                is_prime,
+                badge,
+                brand,
             });
         }
 
@@ -386,6 +445,7 @@ impl AmazonScraper {
                 position_in_page: 0,
                 is_sponsored: true,
                 placement_type: Some(PlacementType::SponsoredProductCarousel),
+                ..Default::default()
             });
             widget_added += 1;
         }
@@ -418,6 +478,7 @@ impl AmazonScraper {
                                 position_in_page: 0,
                                 is_sponsored: true,
                                 placement_type: Some(PlacementType::SponsoredBrand),
+                                ..Default::default()
                             });
                             sb_added += 1;
                         }
@@ -446,6 +507,7 @@ impl AmazonScraper {
                 position_in_page: 0,
                 is_sponsored: true,
                 placement_type: Some(PlacementType::SponsoredBrandVideo),
+                ..Default::default()
             });
             sb_added += 1;
         }
@@ -479,6 +541,7 @@ impl AmazonScraper {
                 position_in_page: 0,
                 is_sponsored: true,
                 placement_type: Some(PlacementType::EditorialRecommendation),
+                ..Default::default()
             });
             editorial_added += 1;
         }
