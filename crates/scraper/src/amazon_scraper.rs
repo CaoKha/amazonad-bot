@@ -19,6 +19,11 @@ impl AmazonScraper {
         Ok(Self { config })
     }
 
+    /// Returns the page-1 search URL (e.g. `https://www.amazon.fr/s?k=montre+connectee`).
+    pub fn search_url(&self) -> String {
+        Self::build_search_url(&self.config.marketplace_url, &self.config.keyword, 1)
+    }
+
     fn find_chrome(config: &ScraperConfig) -> Result<std::path::PathBuf> {
         if let Some(ref path) = config.chrome_executable {
             let p = std::path::PathBuf::from(path);

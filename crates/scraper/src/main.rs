@@ -57,7 +57,7 @@ async fn cmd_run() -> anyhow::Result<()> {
     let http_client = reqwest::Client::new();
     let scraper = Arc::new(amazon_scraper::AmazonScraper::new(Arc::new(config.scraper.clone()))?);
     let state_manager = Arc::new(state::StateManager::new(PathBuf::from("state.json")));
-    let notifier = notifier::TelegramNotifier::new(&config.telegram, http_client.clone())?;
+    let notifier = notifier::TelegramNotifier::new(&config.telegram, http_client.clone(), config.scraper.keyword.clone(), scraper.search_url())?;
     let engine = monitor::MonitorEngine::new(scraper.clone(), state_manager.clone(), notifier, config.scraper.brand_filter.clone());
 
     let bot_token = std::env::var("TELEGRAM_BOT_TOKEN")
@@ -104,7 +104,7 @@ async fn cmd_check_now() -> anyhow::Result<()> {
     let http_client = reqwest::Client::new();
     let scraper = Arc::new(amazon_scraper::AmazonScraper::new(Arc::new(config.scraper.clone()))?);
     let state_manager = Arc::new(state::StateManager::new(PathBuf::from("state.json")));
-    let notifier = notifier::TelegramNotifier::new(&config.telegram, http_client)?;
+    let notifier = notifier::TelegramNotifier::new(&config.telegram, http_client, config.scraper.keyword.clone(), scraper.search_url())?;
     let engine = monitor::MonitorEngine::new(scraper, state_manager, notifier, config.scraper.brand_filter.clone());
 
     let outcome = engine.run_check().await?;
@@ -119,7 +119,8 @@ async fn cmd_dry_run() -> anyhow::Result<()> {
 
     let config = Arc::new(app_config);
 
-    let notifier = notifier::TelegramNotifier::new(&config.telegram, reqwest::Client::new())?;
+    let search_url = amazon_scraper::AmazonScraper::build_search_url(&config.scraper.marketplace_url, &config.scraper.keyword, 1);
+    let notifier = notifier::TelegramNotifier::new(&config.telegram, reqwest::Client::new(), config.scraper.keyword.clone(), search_url)?;
     notifier.send_test_message().await?;
     info!("Telegram: OK");
 

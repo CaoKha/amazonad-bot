@@ -137,8 +137,9 @@ impl CommandListener {
     }
 
     async fn handle_start(&self) {
-        let text = " <b>amazonad-bot</b>\n\nCommands:\n/status - current monitoring state\n/check - scrape amazon.fr right now\n/list - all sponsored products + brands\n/filter &lt;brand&gt; - filter sponsored by brand name";
-        self.send_reply(text).await;
+        let url = escape_html(&self.scraper.search_url());
+        let text = format!(" <b>amazonad-bot</b>\n\nMonitoring: <a href=\"{url}\">{url}</a>\n\nCommands:\n/status - current monitoring state\n/check - scrape right now\n/list - all sponsored products + brands\n/filter &lt;brand&gt; - filter sponsored by brand name");
+        self.send_reply(&text).await;
     }
 
     async fn handle_status(&self) {
@@ -188,7 +189,7 @@ impl CommandListener {
     }
 
     async fn handle_check(&self) {
-        self.send_reply(" Scraping amazon.fr...").await;
+        self.send_reply(&format!(" Scraping <a href=\"{url}\">{url}</a>...", url = escape_html(&self.scraper.search_url()))).await;
 
         let scrape_result = match self.scraper.scrape_search_page().await {
             Ok(r) => r,
@@ -271,7 +272,7 @@ impl CommandListener {
     }
 
     async fn handle_list(&self) {
-        self.send_reply(" Scraping amazon.fr...").await;
+        self.send_reply(&format!(" Scraping <a href=\"{url}\">{url}</a>...", url = escape_html(&self.scraper.search_url()))).await;
 
         let scrape_result = match self.scraper.scrape_search_page().await {
             Ok(r) => r,
@@ -355,7 +356,7 @@ impl CommandListener {
             return;
         }
 
-        self.send_reply(" Scraping amazon.fr...").await;
+        self.send_reply(&format!(" Scraping <a href=\"{url}\">{url}</a>...", url = escape_html(&self.scraper.search_url()))).await;
 
         let scrape_result = match self.scraper.scrape_search_page().await {
             Ok(r) => r,
