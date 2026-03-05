@@ -6,7 +6,8 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 use crate::amazon_scraper::AmazonScraper;
-use mts_common::models::{MonitorState, PlacementType};
+#[allow(unused_imports)]
+use mts_common::models::{KeywordState, MonitorState, PlacementType};
 use mts_common::state::StateManager;
 
 #[allow(dead_code)]
@@ -40,6 +41,8 @@ pub struct CommandListener {
     scraper: Arc<AmazonScraper>,
     state_manager: Arc<StateManager>,
     brand_filter: String,
+    keywords: Vec<String>,
+    marketplace_url: String,
 }
 
 impl CommandListener {
@@ -49,6 +52,8 @@ impl CommandListener {
         scraper: Arc<AmazonScraper>,
         state_manager: Arc<StateManager>,
         brand_filter: String,
+        keywords: Vec<String>,
+        marketplace_url: String,
     ) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -57,6 +62,8 @@ impl CommandListener {
             scraper,
             state_manager,
             brand_filter,
+            keywords,
+            marketplace_url,
         }
     }
 
@@ -137,8 +144,26 @@ impl CommandListener {
     }
 
     async fn handle_start(&self) {
-        let url = escape_html(&self.scraper.search_url());
-        let text = format!(" <b>amazonad-bot</b>\n\nMonitoring: <a href=\"{url}\">{url}</a>\n\nCommands:\n/status - current monitoring state\n/check - scrape right now\n/list - all sponsored products + brands\n/filter &lt;brand&gt; - filter sponsored by brand name");
+        let mut keyword_lines = String::new();
+        for kw in &self.keywords {
+            let url = AmazonScraper::build_search_url(&self.marketplace_url, kw, 1);
+            let url_escaped = escape_html(&url);
+            keyword_lines.push_str(&format!(
+                "• <code>{}</code> → <a href=\"{url_escaped}\">{url_escaped}</a>\n",
+                escape_html(kw)
+            ));
+        }
+        let text = format!(
+            "🔍 <b>amazonad-bot</b>\n\n\
+             Monitoring {} keyword(s):\n{}\n\
+             Commands:\n\
+             /status — current monitoring state\n\
+             /check — show cached last-sweep results\n\
+             /list — all sponsored products from cache\n\
+             /filter &lt;brand&gt; — filter by brand name",
+            self.keywords.len(),
+            keyword_lines.trim_end(),
+        );
         self.send_reply(&text).await;
     }
 
@@ -146,199 +171,207 @@ impl CommandListener {
         let state = match self.state_manager.load() {
             Ok(Some(s)) => s,
             Ok(None) => {
-                self.send_reply("No data yet - daemon has not run a check yet.")
+                self.send_reply("⏳ No data yet — daemon has not completed a sweep.")
                     .await;
                 return;
             }
             Err(e) => {
-                self.send_reply(&format!(" Failed to load state: {e:#}"))
+                self.send_reply(&format!("❌ Failed to load state: {e:#}"))
                     .await;
                 return;
             }
         };
 
-        let pos_str = if state.huawei_positions.is_empty() {
-            "-".to_string()
-        } else {
-            state
-                .huawei_positions
-                .iter()
-                .map(|p| if *p == 0 { "Carousel".to_string() } else { p.to_string() })
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
+        let mut lines = Vec::new();
+        let mut last_check: Option<chrono::DateTime<chrono::Utc>> = None;
 
-        let visible = if state.huawei_ad_visible {
-            "Yes"
-        } else {
-            "No"
-        };
+        for kw in &self.keywords {
+            let ks = state.keywords.get(kw.as_str());
+            match ks {
+                Some(ks) => {
+                    if let Some(lc) = ks.last_checked {
+                        last_check = Some(
+                            last_check
+                                .map_or(lc, |prev: chrono::DateTime<chrono::Utc>| prev.max(lc)),
+                        );
+                    }
+                    let vis = if ks.brand_ad_visible {
+                        "✅ visible"
+                    } else {
+                        "❌ not visible"
+                    };
+                    lines.push(format!(
+                        "• <code>{}</code>: {} {}",
+                        escape_html(kw),
+                        escape_html(&self.brand_filter),
+                        vis
+                    ));
+                }
+                None => {
+                    lines.push(format!(
+                        "• <code>{}</code>: not yet checked",
+                        escape_html(kw)
+                    ));
+                }
+            }
+        }
+
+        let last_str = last_check
+            .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+            .unwrap_or_else(|| "never".to_string());
 
         let text = format!(
-            "Status
-             
-             Huawei ad visible: <b>{visible}</b>
-             Position(s): {pos_str}
-             Last checked: {}
-             Total results scraped: {}",
-            state.updated_at.format("%Y-%m-%d %H:%M UTC "),
-            state.total_results_scraped,
+            "⚙️ <b>Monitoring {} keyword(s)</b>\nLast sweep: {}\n\n{}",
+            self.keywords.len(),
+            last_str,
+            lines.join("\n"),
         );
-
         self.send_reply(&text).await;
     }
 
     async fn handle_check(&self) {
-        self.send_reply(&format!(" Scraping <a href=\"{url}\">{url}</a>...", url = escape_html(&self.scraper.search_url()))).await;
-
-        let scrape_result = match self.scraper.scrape_search_page().await {
-            Ok(r) => r,
+        let state = match self.state_manager.load() {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                self.send_reply("⏳ No data yet — daemon has not completed a sweep.")
+                    .await;
+                return;
+            }
             Err(e) => {
-                self.send_reply(&format!(" Scrape failed: {e:#}")).await;
+                self.send_reply(&format!("❌ Failed to load state: {e:#}"))
+                    .await;
                 return;
             }
         };
 
-        let brand_lower = self.brand_filter.to_lowercase();
-        let sponsored: Vec<(u32, usize, String, bool)> = scrape_result
-            .results
-            .iter()
-            .filter(|r| r.is_sponsored)
-            .map(|r| {
-                let is_huawei = r.title.to_lowercase().contains(&brand_lower);
-                (r.page, r.position_in_page, r.title.clone(), is_huawei)
-            })
-            .collect();
+        let mut lines = Vec::new();
 
-        let new_state = MonitorState {
-            huawei_ad_visible: scrape_result.huawei_sponsored_found,
-            huawei_positions: scrape_result.huawei_sponsored_positions.clone(),
-            total_results_scraped: scrape_result.results.len(),
-            updated_at: chrono::Utc::now(),
-        };
+        for kw in &self.keywords {
+            match state.keywords.get(kw.as_str()) {
+                Some(ks) => {
+                    let time_str = ks
+                        .last_checked
+                        .map(|t| format!("checked {}", t.format("%H:%M")))
+                        .unwrap_or_else(|| "not yet checked".to_string());
 
-        if let Err(e) = self.state_manager.save(&new_state) {
-            self.send_reply(&format!(" Scrape succeeded but failed to save state: {e:#}"))
-                .await;
-            return;
+                    if ks.brand_ad_visible {
+                        let pos_str = ks
+                            .brand_positions
+                            .iter()
+                            .map(|(page, pos, pt)| {
+                                let loc = if *pos == 0 {
+                                    format!("Page {} Carousel", page)
+                                } else {
+                                    format!("Page {} #{}", page, pos)
+                                };
+                                if let Some(pt) = pt {
+                                    format!("{loc} [{pt}]")
+                                } else {
+                                    loc
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        lines.push(format!(
+                            "• <code>{}</code>: {} ✅ {} ({})",
+                            escape_html(kw),
+                            escape_html(&self.brand_filter),
+                            pos_str,
+                            time_str,
+                        ));
+                    } else {
+                        lines.push(format!(
+                            "• <code>{}</code>: {} ❌ not visible ({})",
+                            escape_html(kw),
+                            escape_html(&self.brand_filter),
+                            time_str,
+                        ));
+                    }
+                }
+                None => {
+                    lines.push(format!(
+                        "• <code>{}</code>: not yet checked",
+                        escape_html(kw)
+                    ));
+                }
+            }
         }
 
-        let huawei_line = if scrape_result.huawei_sponsored_found {
-            let pos_str = scrape_result
-                .results
-                .iter()
-                .filter(|r| r.is_sponsored && r.title.to_lowercase().contains(&brand_lower))
-                .map(|r| if r.position_in_page == 0 {
-                    format!("Page {} Carousel", r.page)
-                } else {
-                    format!("Page {} #{}", r.page, r.position_in_page)
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("Huawei ad: <b>visible at {pos_str}</b>")
-        } else {
-            "Huawei ad: <b>not visible</b>".to_string()
-        };
-
-        let display_items = sponsored.iter().take(20).collect::<Vec<_>>();
-        let truncated = sponsored.len().saturating_sub(20);
-
-        let mut sponsored_list = String::new();
-        for (page, pos, title, is_huawei) in &display_items {
-            let marker = if *is_huawei { " " } else { "" };
-            let loc = if *pos == 0 { format!("Page {page} Carousel") } else { format!("Page {page} #{pos}") };
-            sponsored_list.push_str(&format!("* {loc} - {}{marker}\n", escape_html(title)));
-        }
-        if truncated > 0 {
-            sponsored_list.push_str(&format!("... and {truncated} more (use /list to see all)"));
-        }
-
-        let text = format!(
-            " <b>Check complete</b>
-
-             
-
-             {huawei_line}
-
-             Sponsored products ({} total):
-
-             {sponsored_list}
-
-             (State saved)",
-            sponsored.len(),
-        );
-
-        self.send_reply(text.trim()).await;
+        let text = format!("📊 <b>Last sweep results:</b>\n\n{}", lines.join("\n"));
+        self.send_reply(&text).await;
     }
 
     async fn handle_list(&self) {
-        self.send_reply(&format!(" Scraping <a href=\"{url}\">{url}</a>...", url = escape_html(&self.scraper.search_url()))).await;
-
-        let scrape_result = match self.scraper.scrape_search_page().await {
-            Ok(r) => r,
+        let state = match self.state_manager.load() {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                self.send_reply("⏳ No data yet — daemon has not completed a sweep.")
+                    .await;
+                return;
+            }
             Err(e) => {
-                self.send_reply(&format!(" Scrape failed: {e:#}")).await;
+                self.send_reply(&format!("❌ Failed to load state: {e:#}"))
+                    .await;
                 return;
             }
         };
 
-        let sponsored: Vec<(u32, usize, &str, Option<&PlacementType>)> = scrape_result
-            .results
-            .iter()
-            .filter(|r| r.is_sponsored)
-            .map(|r| (r.page, r.position_in_page, r.title.as_str(), r.placement_type.as_ref()))
-            .collect();
+        let mut text = String::from("📋 <b>All sponsored products (cached):</b>\n");
+        let mut total = 0usize;
 
-        let new_state = MonitorState {
-            huawei_ad_visible: scrape_result.huawei_sponsored_found,
-            huawei_positions: scrape_result.huawei_sponsored_positions.clone(),
-            total_results_scraped: scrape_result.results.len(),
-            updated_at: chrono::Utc::now(),
-        };
-
-        if let Err(e) = self.state_manager.save(&new_state) {
-            warn!("Failed to save state after /list: {e:#}");
+        for kw in &self.keywords {
+            match state.keywords.get(kw.as_str()) {
+                Some(ks) => {
+                    let sponsored: Vec<_> =
+                        ks.last_results.iter().filter(|r| r.is_sponsored).collect();
+                    if sponsored.is_empty() {
+                        text.push_str(&format!(
+                            "\n<b>{}</b>: no sponsored products\n",
+                            escape_html(kw)
+                        ));
+                    } else {
+                        text.push_str(&format!(
+                            "\n<b>{}</b> ({} sponsored):\n",
+                            escape_html(kw),
+                            sponsored.len()
+                        ));
+                        for r in sponsored.iter().take(15) {
+                            let loc = if r.position_in_page == 0 {
+                                format!("Page {} Carousel", r.page)
+                            } else {
+                                format!("Page {} #{}", r.page, r.position_in_page)
+                            };
+                            let tag = r
+                                .placement_type
+                                .as_ref()
+                                .map(|t| format!(" [{t}]"))
+                                .unwrap_or_default();
+                            text.push_str(&format!(
+                                "• {loc}{tag} — {}\n",
+                                escape_html(&r.title)
+                            ));
+                        }
+                        let remaining = sponsored.len().saturating_sub(15);
+                        if remaining > 0 {
+                            text.push_str(&format!("... and {} more\n", remaining));
+                        }
+                        total += sponsored.len();
+                    }
+                }
+                None => {
+                    text.push_str(&format!(
+                        "\n<b>{}</b>: not yet checked\n",
+                        escape_html(kw)
+                    ));
+                }
+            }
         }
 
-        if sponsored.is_empty() {
-            self.send_reply(" No sponsored products found.").await;
-            return;
-        }
-
-        let display_items = sponsored.iter().take(20).collect::<Vec<_>>();
-        let truncated = sponsored.len().saturating_sub(20);
-
-        let mut list = String::new();
-        for (page, pos, title, pt) in &display_items {
-            let loc = if *pos == 0 { format!("Page {page} Top/Carousel") } else { format!("Page {page} #{pos}") };
-            let tag = pt.map(|t| format!(" [{t}]")).unwrap_or_default();
-            list.push_str(&format!("* {loc}{tag} - {}\n", escape_html(title)));
-        }
-        if truncated > 0 {
-            list.push_str(&format!("... and {truncated} more "));
-        }
-
-        let mut brands: Vec<String> = sponsored
-            .iter()
-            .filter_map(|(_, _, title, _)| {
-                title.split_whitespace().next().map(|s| s.to_string())
-            })
-            .collect();
-        brands.sort();
-        brands.dedup();
-        let brands_str = brands.join(", ");
-
-        let text = format!(
-            " <b>Sponsored products right now ({} total):</b>
-
-             
-
-             {list}
-
-              Brands: {brands_str}",
-            sponsored.len(),
-        );
-
+        text.push_str(&format!(
+            "\n<i>Total: {} sponsored across {} keywords</i>",
+            total,
+            self.keywords.len()
+        ));
         self.send_reply(text.trim()).await;
     }
 
@@ -352,67 +385,101 @@ impl CommandListener {
             .to_string();
 
         if arg.is_empty() {
-            self.send_reply("Usage: /filter <brand name> - Example: /filter samsung ")
+            self.send_reply("Usage: /filter &lt;brand name&gt;\nExample: /filter samsung")
                 .await;
             return;
         }
 
-        self.send_reply(&format!(" Scraping <a href=\"{url}\">{url}</a>...", url = escape_html(&self.scraper.search_url()))).await;
-
-        let scrape_result = match self.scraper.scrape_search_page().await {
-            Ok(r) => r,
+        let state = match self.state_manager.load() {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                self.send_reply("⏳ No data yet — daemon has not completed a sweep.")
+                    .await;
+                return;
+            }
             Err(e) => {
-                self.send_reply(&format!(" Scrape failed: {e:#}")).await;
+                self.send_reply(&format!("❌ Failed to load state: {e:#}"))
+                    .await;
                 return;
             }
         };
 
-        let brand_lower = arg.to_lowercase();
-        let filtered: Vec<(u32, usize, &str, Option<&PlacementType>)> = scrape_result
-            .results
-            .iter()
-            .filter(|r| r.is_sponsored && r.title.to_lowercase().contains(&brand_lower))
-            .map(|r| (r.page, r.position_in_page, r.title.as_str(), r.placement_type.as_ref()))
-            .collect();
-
-        if filtered.is_empty() {
-            self.send_reply(&format!(r#"No sponsored products matching "{arg}" found. "#))
-            .await;
-            return;
-        }
-
-        let display_items = filtered.iter().take(20).collect::<Vec<_>>();
-        let truncated = filtered.len().saturating_sub(20);
-
-        let mut list = String::new();
-        for (page, pos, title, pt) in &display_items {
-            let loc = if *pos == 0 { format!("Page {page} Top/Carousel") } else { format!("Page {page} #{pos}") };
-            let tag = pt.map(|t| format!(" [{t}]")).unwrap_or_default();
-            list.push_str(&format!("* {loc}{tag} - {}\n", escape_html(title)));
-        }
-        if truncated > 0 {
-            list.push_str(&format!("... and {truncated} more "));
-        }
-
-        let text = format!(
-            r#" <b>Sponsored products matching "{arg}" ({} found):</b>
-             
-             {list}"#,
-            filtered.len(),
+        let filter_lower = arg.to_lowercase();
+        let mut text = format!(
+            "🔎 <b>Sponsored products matching \"{}\":</b>\n",
+            escape_html(&arg)
         );
+        let mut total = 0usize;
 
-        self.send_reply(text.trim()).await;
+        for kw in &self.keywords {
+            if let Some(ks) = state.keywords.get(kw.as_str()) {
+                let matched: Vec<_> = ks
+                    .last_results
+                    .iter()
+                    .filter(|r| r.is_sponsored && r.title.to_lowercase().contains(&filter_lower))
+                    .collect();
+                if !matched.is_empty() {
+                    text.push_str(&format!("\n<b>{}</b>:\n", escape_html(kw)));
+                    for r in matched.iter().take(10) {
+                        let loc = if r.position_in_page == 0 {
+                            format!("Page {} Carousel", r.page)
+                        } else {
+                            format!("Page {} #{}", r.page, r.position_in_page)
+                        };
+                        let tag = r
+                            .placement_type
+                            .as_ref()
+                            .map(|t| format!(" [{t}]"))
+                            .unwrap_or_default();
+                        text.push_str(&format!(
+                            "• {loc}{tag} — {}\n",
+                            escape_html(&r.title)
+                        ));
+                    }
+                    total += matched.len();
+                }
+            }
+        }
+
+        if total == 0 {
+            self.send_reply(&format!(
+                "No sponsored products matching \"{}\" found in cache.",
+                escape_html(&arg)
+            ))
+            .await;
+        } else {
+            text.push_str(&format!("\n<i>{} match(es) total</i>", total));
+            self.send_reply(text.trim()).await;
+        }
     }
 
     async fn send_reply(&self, text: &str) {
-        let text = if text.len() > 4000 {
-            let mut end = 4000;
-            while !text.is_char_boundary(end) { end -= 1; }
-            &text[..end]
-        } else {
-            text
-        };
+        // Split long messages at newline boundaries
+        if text.len() <= 4000 {
+            self.send_single_reply(text).await;
+            return;
+        }
 
+        let mut remaining = text;
+        while !remaining.is_empty() {
+            if remaining.len() <= 4000 {
+                self.send_single_reply(remaining).await;
+                break;
+            }
+            let mut end = 4000;
+            while !remaining.is_char_boundary(end) {
+                end -= 1;
+            }
+            let split_at = remaining[..end]
+                .rfind('\n')
+                .map(|p| p + 1)
+                .unwrap_or(end);
+            self.send_single_reply(&remaining[..split_at]).await;
+            remaining = &remaining[split_at..];
+        }
+    }
+
+    async fn send_single_reply(&self, text: &str) {
         let url = format!(
             "https://api.telegram.org/bot{}/sendMessage",
             self.bot_token

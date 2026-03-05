@@ -57,8 +57,17 @@ async fn cmd_run() -> anyhow::Result<()> {
     let http_client = reqwest::Client::new();
     let scraper = Arc::new(amazon_scraper::AmazonScraper::new(Arc::new(config.scraper.clone()))?);
     let state_manager = Arc::new(state::StateManager::new(PathBuf::from("state.json")));
-    let notifier = notifier::TelegramNotifier::new(&config.telegram, http_client.clone(), config.scraper.keyword.clone(), scraper.search_url())?;
-    let engine = monitor::MonitorEngine::new(scraper.clone(), state_manager.clone(), notifier, config.scraper.brand_filter.clone());
+    let telegram_config = Arc::new(config.telegram.clone());
+
+    let engine = monitor::MonitorEngine::new(
+        scraper.clone(),
+        state_manager.clone(),
+        http_client.clone(),
+        telegram_config,
+        config.scraper.brand_filter.clone(),
+        config.scraper.keywords.clone(),
+        config.scraper.marketplace_url.clone(),
+    );
 
     let bot_token = std::env::var("TELEGRAM_BOT_TOKEN")
         .expect("TELEGRAM_BOT_TOKEN must be set");
@@ -68,11 +77,14 @@ async fn cmd_run() -> anyhow::Result<()> {
         scraper.clone(),
         state_manager.clone(),
         config.scraper.brand_filter.clone(),
+        config.scraper.keywords.clone(),
+        config.scraper.marketplace_url.clone(),
     );
     tokio::spawn(async move { listener.run().await });
 
     info!(
-        "Starting monitoring loop (interval: {} min)",
+        "Starting monitoring loop ({} keywords, interval: {} min)",
+        config.scraper.keywords.len(),
         config.monitoring.interval_minutes
     );
 
@@ -84,8 +96,8 @@ async fn cmd_run() -> anyhow::Result<()> {
         tokio::select! {
             _ = interval.tick() => {
                 match engine.run_check().await {
-                    Ok(outcome) => info!("Check complete: {:?}", outcome),
-                    Err(e) => tracing::error!("Check failed: {e:#}"),
+                    Ok(()) => info!("Sweep complete"),
+                    Err(e) => tracing::error!("Sweep failed: {e:#}"),
                 }
             }
             _ = tokio::signal::ctrl_c() => {
@@ -104,23 +116,43 @@ async fn cmd_check_now() -> anyhow::Result<()> {
     let http_client = reqwest::Client::new();
     let scraper = Arc::new(amazon_scraper::AmazonScraper::new(Arc::new(config.scraper.clone()))?);
     let state_manager = Arc::new(state::StateManager::new(PathBuf::from("state.json")));
-    let notifier = notifier::TelegramNotifier::new(&config.telegram, http_client, config.scraper.keyword.clone(), scraper.search_url())?;
-    let engine = monitor::MonitorEngine::new(scraper, state_manager, notifier, config.scraper.brand_filter.clone());
+    let telegram_config = Arc::new(config.telegram.clone());
 
-    let outcome = engine.run_check().await?;
-    info!("Check complete: {:?}", outcome);
+    let engine = monitor::MonitorEngine::new(
+        scraper,
+        state_manager,
+        http_client,
+        telegram_config,
+        config.scraper.brand_filter.clone(),
+        config.scraper.keywords.clone(),
+        config.scraper.marketplace_url.clone(),
+    );
+
+    engine.run_check().await?;
+    info!("Check complete");
 
     Ok(())
 }
 
 async fn cmd_dry_run() -> anyhow::Result<()> {
     let app_config = config::load_config()?;
-    info!("Config loaded: OK");
+    info!("Config loaded: OK ({} keywords)", app_config.scraper.keywords.len());
 
     let config = Arc::new(app_config);
 
-    let search_url = amazon_scraper::AmazonScraper::build_search_url(&config.scraper.marketplace_url, &config.scraper.keyword, 1);
-    let notifier = notifier::TelegramNotifier::new(&config.telegram, reqwest::Client::new(), config.scraper.keyword.clone(), search_url)?;
+    // Use first keyword for the test message URL
+    let first_kw = config.scraper.keywords.first().map(|s| s.as_str()).unwrap_or("test");
+    let search_url = amazon_scraper::AmazonScraper::build_search_url(
+        &config.scraper.marketplace_url,
+        first_kw,
+        1,
+    );
+    let notifier = notifier::TelegramNotifier::new(
+        &config.telegram,
+        reqwest::Client::new(),
+        first_kw.to_string(),
+        search_url,
+    )?;
     notifier.send_test_message().await?;
     info!("Telegram: OK");
 
