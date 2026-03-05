@@ -1,4 +1,4 @@
-# monitoring-the-situation
+# amazonad-bot
 
 ## What This Does
 
@@ -45,8 +45,8 @@ Two independent monitoring modes, same Telegram alerts:
 
 ```bash
 # 1. Clone and build
-git clone https://github.com/YOUR_USERNAME/monitoring-the-situation.git
-cd monitoring-the-situation
+git clone https://github.com/CaoKha/amazonad-bot.git
+cd amazonad-bot
 cargo build --release
 
 # 2. Configure

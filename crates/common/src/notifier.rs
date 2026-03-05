@@ -94,7 +94,7 @@ impl TelegramNotifier {
     }
 
     pub async fn send_test_message(&self) -> Result<()> {
-        self.send_message("\u{1f9b7} monitoring-the-situation connected successfully")
+        self.send_message("\u{1f9b7} amazonad-bot connected successfully")
             .await
     }
 

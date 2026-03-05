@@ -10,7 +10,7 @@ Type=simple
 User=monitor
 Group=monitor
 WorkingDirectory=/opt/ads-monitor
-ExecStart=/opt/ads-monitor/monitoring-the-situation run
+ExecStart=/opt/ads-monitor/amazonad-bot run
 Restart=always
 RestartSec=10
 Environment=RUST_LOG=info

@@ -142,7 +142,7 @@ impl CommandListener {
     }
 
     async fn handle_start(&self) {
-        let text = " <b>monitoring-the-situation bot</b>\n\nCommands:\n/status - current monitoring state\n/check - scrape amazon.fr right now\n/list - all sponsored products + brands\n/filter &lt;brand&gt; - filter sponsored by brand name";
+        let text = " <b>amazonad-bot</b>\n\nCommands:\n/status - current monitoring state\n/check - scrape amazon.fr right now\n/list - all sponsored products + brands\n/filter &lt;brand&gt; - filter sponsored by brand name";
         self.send_reply(text).await;
     }
 

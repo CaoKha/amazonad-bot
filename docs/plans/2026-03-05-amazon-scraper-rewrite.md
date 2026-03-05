@@ -21,7 +21,7 @@ Replace the `[dependencies]` section. Remove `flate2 = "1"`, add `scraper = "0.2
 
 ```toml
 [package]
-name = "monitoring-the-situation"
+name = "amazonad-bot"
 version = "0.1.0"
 edition = "2024"
 
@@ -724,7 +724,7 @@ impl TelegramNotifier {
 
     /// Send a test message to verify connectivity (used in dry-run mode).
     pub async fn send_test_message(&self) -> Result<()> {
-        self.send_message("\u{1f9b7} monitoring-the-situation connected successfully")
+        self.send_message("\u{1f9b7} amazonad-bot connected successfully")
             .await
     }
 
@@ -790,7 +790,7 @@ pub mod state;
 **Step 1: Replace entire file content**
 
 ```rust
-use monitoring_the_situation::{amazon_scraper, config, monitor, notifier, state};
+use amazonad_bot::{amazon_scraper, config, monitor, notifier, state};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -801,7 +801,7 @@ use tracing::info;
 
 #[derive(Parser)]
 #[command(
-    name = "monitoring-the-situation",
+    name = "amazonad-bot",
     about = "Monitors amazon.fr for Huawei smartwatch sponsored ads"
 )]
 struct Cli {
@@ -824,7 +824,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("monitoring_the_situation=info".parse().unwrap()),
+                .add_directive("amazonad_bot=info".parse().unwrap()),
         )
         .init();
 
@@ -962,7 +962,7 @@ interval_minutes = 30
 ```rust
 use std::sync::Mutex;
 
-use monitoring_the_situation::config::load_config;
+use amazonad_bot::config::load_config;
 
 /// Serialize all config tests — they share process-level env vars.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -1083,7 +1083,7 @@ fn interval_at_minimum_is_valid() {
 ### tests/models_tests.rs
 
 ```rust
-use monitoring_the_situation::models::{MonitorState, SearchResult};
+use amazonad_bot::models::{MonitorState, SearchResult};
 
 #[test]
 fn search_result_serialization() {
@@ -1151,7 +1151,7 @@ fn monitor_state_no_ad() {
 // Uses MonitorState directly — no HTTP mocking needed.
 // ---------------------------------------------------------------------------
 
-use monitoring_the_situation::models::{CheckOutcome, MonitorState};
+use amazonad_bot::models::{CheckOutcome, MonitorState};
 
 fn make_state(huawei_visible: bool, positions: Vec<usize>) -> MonitorState {
     MonitorState {
@@ -1233,8 +1233,8 @@ fn check_outcome_variants_are_debug() {
 ```rust
 use std::sync::Mutex;
 
-use monitoring_the_situation::config::TelegramConfig;
-use monitoring_the_situation::notifier::TelegramNotifier;
+use amazonad_bot::config::TelegramConfig;
+use amazonad_bot::notifier::TelegramNotifier;
 
 /// Serialize notifier tests — they share TELEGRAM_BOT_TOKEN env var.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -1307,8 +1307,8 @@ Update `sample_state()` to use new `MonitorState` fields:
 use std::path::PathBuf;
 
 use chrono::Utc;
-use monitoring_the_situation::models::MonitorState;
-use monitoring_the_situation::state::StateManager;
+use amazonad_bot::models::MonitorState;
+use amazonad_bot::state::StateManager;
 
 fn temp_state_path() -> PathBuf {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1393,7 +1393,7 @@ fn atomic_tmp_cleanup() {
 ### tests/scraper_tests.rs (NEW — most important)
 
 ```rust
-use monitoring_the_situation::amazon_scraper::AmazonScraper;
+use amazonad_bot::amazon_scraper::AmazonScraper;
 
 // ── HTML fixtures ────────────────────────────────────────────────────────────
 
@@ -1653,7 +1653,7 @@ fn build_search_url_trims_trailing_slash() {
 **Step 1: Replace entire README.md**
 
 ```markdown
-# monitoring-the-situation
+# amazonad-bot
 
 ## What This Does
 
@@ -1694,8 +1694,8 @@ No Amazon account required — it scrapes the public search page.
 
 ```bash
 # 1. Clone and build
-git clone https://github.com/YOUR_USERNAME/monitoring-the-situation.git
-cd monitoring-the-situation
+git clone https://github.com/CaoKha/amazonad-bot.git
+cd amazonad-bot
 cargo build --release
 
 # 2. Configure
@@ -1865,7 +1865,7 @@ pub struct ScraperConfig { ... }
 ```
 
 ### Module naming
-The module is named `amazon_scraper` (not `scraper`) to avoid conflict with the `scraper` crate. In `lib.rs`: `pub mod amazon_scraper;`. In `main.rs`: `use monitoring_the_situation::amazon_scraper;`.
+The module is named `amazon_scraper` (not `scraper`) to avoid conflict with the `scraper` crate. In `lib.rs`: `pub mod amazon_scraper;`. In `main.rs`: `use amazonad_bot::amazon_scraper;`.
 
 ### parse_results is pub
 `AmazonScraper::parse_results` must be `pub` so `tests/scraper_tests.rs` can call it directly without HTTP.
