@@ -54,9 +54,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 async fn cmd_run() -> anyhow::Result<()> {
     let app_config = config::load_config()?;
     let config = Arc::new(app_config);
+    let http_client = reqwest::Client::new();
     let scraper = Arc::new(amazon_scraper::AmazonScraper::new(Arc::new(config.scraper.clone()))?);
     let state_manager = Arc::new(state::StateManager::new(PathBuf::from("state.json")));
-    let notifier = notifier::TelegramNotifier::new(&config.telegram)?;
+    let notifier = notifier::TelegramNotifier::new(&config.telegram, http_client.clone())?;
     let engine = monitor::MonitorEngine::new(scraper.clone(), state_manager.clone(), notifier, config.scraper.brand_filter.clone());
 
     let bot_token = std::env::var("TELEGRAM_BOT_TOKEN")
@@ -100,9 +101,10 @@ async fn cmd_run() -> anyhow::Result<()> {
 async fn cmd_check_now() -> anyhow::Result<()> {
     let app_config = config::load_config()?;
     let config = Arc::new(app_config);
+    let http_client = reqwest::Client::new();
     let scraper = Arc::new(amazon_scraper::AmazonScraper::new(Arc::new(config.scraper.clone()))?);
     let state_manager = Arc::new(state::StateManager::new(PathBuf::from("state.json")));
-    let notifier = notifier::TelegramNotifier::new(&config.telegram)?;
+    let notifier = notifier::TelegramNotifier::new(&config.telegram, http_client)?;
     let engine = monitor::MonitorEngine::new(scraper, state_manager, notifier, config.scraper.brand_filter.clone());
 
     let outcome = engine.run_check().await?;
@@ -117,7 +119,7 @@ async fn cmd_dry_run() -> anyhow::Result<()> {
 
     let config = Arc::new(app_config);
 
-    let notifier = notifier::TelegramNotifier::new(&config.telegram)?;
+    let notifier = notifier::TelegramNotifier::new(&config.telegram, reqwest::Client::new())?;
     notifier.send_test_message().await?;
     info!("Telegram: OK");
 

@@ -88,6 +88,8 @@ impl AmazonScraper {
 
         let mut all_results: Vec<SearchResult> = Vec::new();
         let mut global_position = 0usize;
+        let mut huawei_sponsored_found = false;
+        let mut huawei_sponsored_positions: Vec<usize> = Vec::new();
 
         for page_num in 1..=self.config.pages {
             let url = Self::build_search_url(
@@ -196,6 +198,11 @@ impl AmazonScraper {
                 break;
             }
 
+            if page_result.huawei_sponsored_found {
+                huawei_sponsored_found = true;
+                huawei_sponsored_positions.extend(&page_result.huawei_sponsored_positions);
+            }
+
             global_position += page_result.results.len();
             all_results.extend(page_result.results);
 
@@ -206,23 +213,7 @@ impl AmazonScraper {
             }
         }
 
-        let brand_lower = self.config.brand_filter.to_lowercase();
-        let huawei_sponsored: Vec<&SearchResult> = all_results
-            .iter()
-            .filter(|r| r.is_sponsored && r.title.to_lowercase().contains(&brand_lower))
-            .collect();
-
-        let huawei_sponsored_found = !huawei_sponsored.is_empty();
-        let mut huawei_sponsored_positions: Vec<usize> =
-            huawei_sponsored.iter().map(|r| r.position).collect();
         huawei_sponsored_positions.dedup();
-
-        if huawei_sponsored_found {
-            warn!(
-                "Huawei sponsored ad found at position(s): {:?}",
-                huawei_sponsored_positions
-            );
-        }
 
         debug!(
             "Scraped {} total results across {} page(s), huawei_sponsored_found={}",
@@ -244,32 +235,40 @@ impl AmazonScraper {
     }
 
     pub fn parse_results_with_offset(html: &str, brand_filter: &str, offset: usize, page: u32) -> ScrapeResult {
+        use std::sync::LazyLock;
+
+        static RESULT_SEL: LazyLock<Selector> = LazyLock::new(||
+            Selector::parse(r#"div[data-component-type="s-search-result"]"#).unwrap());
+        static SPONSORED_SEL: LazyLock<Selector> = LazyLock::new(||
+            Selector::parse(r#"div[data-component-type="sp-sponsored-result"]"#).unwrap());
+        static ADHOLDER_SEL: LazyLock<Selector> = LazyLock::new(||
+            Selector::parse(".AdHolder").unwrap());
+        static H2_SEL: LazyLock<Selector> = LazyLock::new(||
+            Selector::parse("h2").unwrap());
+        static SPONSORED_LABEL_SEL: LazyLock<Selector> = LazyLock::new(||
+            Selector::parse(".puis-sponsored-label-text").unwrap());
+        static FEEDBACK_SEL: LazyLock<Selector> = LazyLock::new(||
+            Selector::parse(r#"span[data-action="multi-ad-feedback-form-trigger"]"#).unwrap());
+
         let document = Html::parse_document(html);
         let brand_lower = brand_filter.to_lowercase();
 
-        let result_sel =
-            Selector::parse(r#"div[data-component-type="s-search-result"]"#).unwrap();
-        let sponsored_sel =
-            Selector::parse(r#"div[data-component-type="sp-sponsored-result"]"#).unwrap();
-        let adholder_sel = Selector::parse(".AdHolder").unwrap();
-        let h2_sel = Selector::parse("h2").unwrap();
-
         let sponsored_asins: HashSet<String> = document
-            .select(&sponsored_sel)
+            .select(&SPONSORED_SEL)
             .filter_map(|el| el.value().attr("data-asin").map(String::from))
             .collect();
 
         let adholder_asins: HashSet<String> = document
-            .select(&adholder_sel)
+            .select(&ADHOLDER_SEL)
             .filter_map(|el| el.value().attr("data-asin").map(String::from))
             .collect();
 
         debug!(
             "parse page={} result_count={} sp_sponsored_count={} adholder_count={}",
             page,
-            document.select(&result_sel).count(),
-            document.select(&sponsored_sel).count(),
-            document.select(&adholder_sel).count(),
+            document.select(&RESULT_SEL).count(),
+            document.select(&SPONSORED_SEL).count(),
+            document.select(&ADHOLDER_SEL).count(),
         );
         debug!(
             "adholder_asins: {:?}, sponsored_asins: {:?}",
@@ -280,7 +279,7 @@ impl AmazonScraper {
         let mut results = Vec::new();
         let mut position = offset;
         let mut pos_in_page: usize = 0;
-        for element in document.select(&result_sel) {
+        for element in document.select(&RESULT_SEL) {
             let asin = match element.value().attr("data-asin") {
                 Some(a) if !a.is_empty() => a.to_string(),
                 _ => continue,
@@ -290,7 +289,7 @@ impl AmazonScraper {
             pos_in_page += 1;
 
             let title = element
-                .select(&h2_sel)
+                .select(&H2_SEL)
                 .next()
                 .map(|h| {
                     let text = h.text().collect::<String>().trim().to_string();
@@ -307,12 +306,11 @@ impl AmazonScraper {
                 })
                 .unwrap_or_default();
 
-            let text_content = element.text().collect::<String>();
-            let has_sponsored_class = element.inner_html().contains("puis-sponsored-label-text");
+            let has_sponsored_text = element.text().any(|t| t.contains("Sponsorisé") || t.contains("Sponsored"));
+            let has_sponsored_class = element.select(&SPONSORED_LABEL_SEL).next().is_some();
             let is_sponsored = sponsored_asins.contains(&asin)
                 || adholder_asins.contains(&asin)
-                || text_content.contains("Sponsorisé")
-                || text_content.contains("Sponsored")
+                || has_sponsored_text
                 || has_sponsored_class;
 
             if pos_in_page <= 5 {
@@ -321,7 +319,7 @@ impl AmazonScraper {
                     page, pos_in_page, asin, title.len(),
                     sponsored_asins.contains(&asin),
                     adholder_asins.contains(&asin),
-                    text_content.contains("Sponsored") || text_content.contains("Sponsorisé"),
+                    has_sponsored_text,
                     has_sponsored_class,
                     is_sponsored,
                 );
@@ -339,11 +337,9 @@ impl AmazonScraper {
 
         // === Parse thematic sponsored carousel widgets ===
         let already_seen: HashSet<String> = results.iter().map(|r| r.asin.clone()).collect();
-        let feedback_sel =
-            Selector::parse(r#"span[data-action="multi-ad-feedback-form-trigger"]"#).unwrap();
         let mut widget_added = 0usize;
 
-        for widget in document.select(&feedback_sel) {
+        for widget in document.select(&FEEDBACK_SEL) {
             let Some(attr) = widget.value().attr("data-multi-ad-feedback-form-trigger") else {
                 continue;
             };
@@ -364,21 +360,21 @@ impl AmazonScraper {
                 ads.len(),
                 inner["adPlacementMetaData"]["slotName"].as_str().unwrap_or("?"),
             );
-            for ad in ads {
-                let asin = ad["asin"].as_str().unwrap_or("").to_string();
-                let title = ad["title"].as_str().unwrap_or("").trim().to_string();
-                if asin.is_empty() || already_seen.contains(&asin) { continue; }
-                results.push(SearchResult {
-                    asin: asin.clone(),
-                    title,
-                    position: 0,
-                    page,
-                    position_in_page: 0,
-                    is_sponsored: true,
-                });
-                widget_added += 1;
-                debug!("widget: added asin={}", asin);
-            }
+        for ad in ads {
+            let asin = ad["asin"].as_str().unwrap_or("");
+            let title = ad["title"].as_str().unwrap_or("").trim().to_string();
+            if asin.is_empty() || already_seen.contains(asin) { continue; }
+            debug!("widget: added asin={}", asin);
+            results.push(SearchResult {
+                asin: asin.to_string(),
+                title,
+                position: 0,
+                page,
+                position_in_page: 0,
+                is_sponsored: true,
+            });
+            widget_added += 1;
+        }
         }
         debug!("parse page={} widget_carousel_added={}", page, widget_added);
 

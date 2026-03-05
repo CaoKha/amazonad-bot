@@ -13,7 +13,7 @@ fn new_fails_without_bot_token() {
     }
 
     let config = TelegramConfig { chat_id: 123456789 };
-    let result = TelegramNotifier::new(&config);
+    let result = TelegramNotifier::new(&config, reqwest::Client::new());
 
     assert!(result.is_err());
     let err_msg = format!("{:#}", result.err().unwrap());
@@ -34,7 +34,7 @@ fn new_succeeds_with_valid_token() {
     }
 
     let config = TelegramConfig { chat_id: 123456789 };
-    let result = TelegramNotifier::new(&config);
+    let result = TelegramNotifier::new(&config, reqwest::Client::new());
     assert!(result.is_ok(), "Should succeed with valid token");
 
     unsafe {
@@ -50,7 +50,7 @@ fn new_fails_with_empty_token() {
     }
 
     let config = TelegramConfig { chat_id: 123456789 };
-    let result = TelegramNotifier::new(&config);
+    let result = TelegramNotifier::new(&config, reqwest::Client::new());
 
     assert!(result.is_err());
     let err_msg = format!("{:#}", result.err().unwrap());

@@ -1,10 +1,4 @@
-// Escape HTML special characters for Telegram parse_mode=HTML
-fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
+use crate::escape_html;
 
 use anyhow::{bail, Context, Result};
 use tracing::warn;
@@ -18,7 +12,7 @@ pub struct TelegramNotifier {
 }
 
 impl TelegramNotifier {
-    pub fn new(config: &TelegramConfig) -> Result<Self> {
+    pub fn new(config: &TelegramConfig, client: reqwest::Client) -> Result<Self> {
         let bot_token = std::env::var("TELEGRAM_BOT_TOKEN")
             .context("TELEGRAM_BOT_TOKEN environment variable not set")?;
 
@@ -27,7 +21,7 @@ impl TelegramNotifier {
         }
 
         Ok(Self {
-            client: reqwest::Client::new(),
+            client,
             bot_token,
             chat_id: config.chat_id,
         })
@@ -59,10 +53,9 @@ impl TelegramNotifier {
 
             let mut sponsored_list = String::new();
             for (page, pos, title) in &display_items {
-                let suffix = if positions.contains(&(*page, *pos)) { " ✓" } else { "" };
+                let suffix = if positions.contains(&(*page, *pos)) { " \u{2713}" } else { "" };
                 let loc = if *pos == 0 { format!("Page {page} Carousel") } else { format!("Page {page} #{pos}") };
-                sponsored_list.push_str(&format!("• {loc} — {}{}
-", escape_html(title), suffix));
+                sponsored_list.push_str(&format!("• {loc} — {}{}\n", escape_html(title), suffix));
             }
             if truncated > 0 {
                 sponsored_list.push_str(&format!("... and {truncated} more"));
@@ -75,7 +68,7 @@ impl TelegramNotifier {
                  Keyword: <code>montre connectee</code>\n\
                  Position(s): <b>{pos_str}</b>\n\
                  Title: {}\n\n\
-                 📋 Sponsored products on page ({} total):\n{}",
+                 \u{1f4cb} Sponsored products on page ({} total):\n{}",
                 escape_html(sample_title),
                 all_sponsored.len(),
                 sponsored_list
@@ -86,11 +79,7 @@ impl TelegramNotifier {
     }
 
     pub async fn send_ad_disappeared(&self) -> Result<()> {
-        let message =
-            "\u{1f4ed} Huawei ad no longer visible on amazon.fr for \u{2018}montre connectee\u{2019}"
-                .to_string();
-
-        self.send_message(&message).await
+        self.send_message("\u{1f4ed} Huawei ad no longer visible on amazon.fr for \u{2018}montre connectee\u{2019}").await
     }
 
     pub async fn send_test_message(&self) -> Result<()> {
@@ -101,7 +90,9 @@ impl TelegramNotifier {
     async fn send_message(&self, text: &str) -> Result<()> {
         // Safety net: truncate to 4000 chars if needed
         let text = if text.len() > 4000 {
-            &text[..4000]
+            let mut end = 4000;
+            while !text.is_char_boundary(end) { end -= 1; }
+            &text[..end]
         } else {
             text
         };

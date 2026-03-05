@@ -87,18 +87,14 @@ impl MonitorEngine {
                         "Huawei ad appeared at positions: {:?}",
                         new_state.huawei_positions
                     );
-                    let huawei_page_positions: Vec<(u32, usize)> = scrape_result
-                        .results
-                        .iter()
-                        .filter(|r| r.is_sponsored && r.title.to_lowercase().contains(&brand_lower))
-                        .map(|r| (r.page, r.position_in_page))
-                        .collect();
-                    let all_sponsored: Vec<(u32, usize, String)> = scrape_result
-                        .results
-                        .iter()
-                        .filter(|r| r.is_sponsored)
-                        .map(|r| (r.page, r.position_in_page, r.title.clone()))
-                        .collect();
+                    let mut huawei_page_positions: Vec<(u32, usize)> = Vec::new();
+                    let mut all_sponsored: Vec<(u32, usize, String)> = Vec::new();
+                    for r in scrape_result.results.iter().filter(|r| r.is_sponsored) {
+                        all_sponsored.push((r.page, r.position_in_page, r.title.clone()));
+                        if r.title.to_lowercase().contains(&brand_lower) {
+                            huawei_page_positions.push((r.page, r.position_in_page));
+                        }
+                    }
                     self.notifier
                         .send_ad_appeared(&huawei_page_positions, &sample_title, &all_sponsored)
                         .await?;

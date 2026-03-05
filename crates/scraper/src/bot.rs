@@ -1,9 +1,4 @@
-fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
+use mts_common::escape_html;
 
 use std::sync::Arc;
 
@@ -408,7 +403,9 @@ impl CommandListener {
 
     async fn send_reply(&self, text: &str) {
         let text = if text.len() > 4000 {
-            &text[..4000]
+            let mut end = 4000;
+            while !text.is_char_boundary(end) { end -= 1; }
+            &text[..end]
         } else {
             text
         };
