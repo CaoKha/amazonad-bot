@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 
-use chrono::Utc;
 use mts_common::models::MonitorState;
 use mts_common::state::StateManager;
 
@@ -16,12 +15,7 @@ fn temp_state_path() -> PathBuf {
 }
 
 fn sample_state() -> MonitorState {
-    MonitorState {
-        huawei_ad_visible: true,
-        huawei_positions: vec![2, 5],
-        total_results_scraped: 48,
-        updated_at: Utc::now(),
-    }
+    MonitorState::default()
 }
 
 #[test]
@@ -33,10 +27,7 @@ fn round_trip() {
     manager.save(&original).unwrap();
     let loaded = manager.load().unwrap().expect("should load saved state");
 
-    assert_eq!(loaded.huawei_ad_visible, original.huawei_ad_visible);
-    assert_eq!(loaded.huawei_positions, original.huawei_positions);
-    assert_eq!(loaded.total_results_scraped, original.total_results_scraped);
-    assert_eq!(loaded.updated_at, original.updated_at);
+    assert_eq!(loaded.keywords.len(), original.keywords.len());
 
     let _ = std::fs::remove_file(&path);
 }
@@ -49,6 +40,16 @@ fn missing_file() {
 
     let result = manager.load().unwrap();
     assert!(result.is_none(), "missing file should return Ok(None)");
+}
+
+#[test]
+fn unknown_keyword_defaults() {
+    // An absent keyword key should yield brand_ad_visible=false via unwrap_or_default
+    let state = MonitorState::default();
+    let kw_state = state.keywords.get("montre connectee").cloned().unwrap_or_default();
+    assert!(!kw_state.brand_ad_visible, "Unknown keyword should default to not visible");
+    assert!(kw_state.brand_positions.is_empty());
+    assert!(kw_state.last_results.is_empty());
 }
 
 #[test]

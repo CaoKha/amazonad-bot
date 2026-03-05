@@ -490,3 +490,90 @@ fn widget_carousel_products_are_listed_as_sponsored() {
 
     assert!(result.huawei_sponsored_found);
 }
+
+// ===== Enrichment field tests =====
+
+const HTML_WITH_PRICE: &str = r#"
+<!DOCTYPE html>
+<html>
+<body>
+<div data-component-type="s-search-result" data-asin="B0HUAWEI01" class="sg-col AdHolder">
+  <span class="puis-label-popover puis-sponsored-label-text">
+    <span class="a-color-secondary">Sponsored</span>
+  </span>
+  <h2>Huawei Watch GT 4</h2>
+  <span class="a-price">
+    <span class="a-offscreen">149,99 €</span>
+  </span>
+</div>
+</body>
+</html>
+"#;
+
+const HTML_WITH_RATING: &str = r#"
+<!DOCTYPE html>
+<html>
+<body>
+<div data-component-type="s-search-result" data-asin="B0HUAWEI01" class="sg-col AdHolder">
+  <span class="puis-label-popover puis-sponsored-label-text">
+    <span class="a-color-secondary">Sponsored</span>
+  </span>
+  <h2>Huawei Watch GT 4</h2>
+  <span class="a-icon-alt">4,5 sur 5 étoiles</span>
+</div>
+</body>
+</html>
+"#;
+
+const HTML_WITH_BEST_SELLER_BADGE: &str = r#"
+<!DOCTYPE html>
+<html>
+<body>
+<div data-component-type="s-search-result" data-asin="B0HUAWEI01" class="sg-col AdHolder">
+  <span class="puis-label-popover puis-sponsored-label-text">
+    <span class="a-color-secondary">Sponsored</span>
+  </span>
+  <h2>Huawei Watch GT 4</h2>
+  <span class="a-badge-text">Meilleur vendeur</span>
+</div>
+</body>
+</html>
+"#;
+
+#[test]
+fn price_parsed_from_offscreen_span() {
+    let result = AmazonScraper::parse_results(HTML_WITH_PRICE, "huawei");
+    let huawei = result.results.iter().find(|r| r.asin == "B0HUAWEI01").unwrap();
+    assert_eq!(
+        huawei.price.as_deref(),
+        Some("149,99 €"),
+        "Price should be parsed from .a-price .a-offscreen"
+    );
+}
+
+#[test]
+fn rating_parsed_from_icon_alt() {
+    let result = AmazonScraper::parse_results(HTML_WITH_RATING, "huawei");
+    let huawei = result.results.iter().find(|r| r.asin == "B0HUAWEI01").unwrap();
+    assert!(
+        huawei.rating.is_some(),
+        "Rating should be parsed from span.a-icon-alt"
+    );
+    let rating = huawei.rating.unwrap();
+    assert!(
+        (rating - 4.5).abs() < 0.01,
+        "Rating should be 4.5, got: {rating}"
+    );
+}
+
+#[test]
+fn best_seller_badge_detected() {
+    use mts_common::models::BadgeType;
+    let result = AmazonScraper::parse_results(HTML_WITH_BEST_SELLER_BADGE, "huawei");
+    let huawei = result.results.iter().find(|r| r.asin == "B0HUAWEI01").unwrap();
+    assert_eq!(
+        huawei.badge,
+        Some(BadgeType::BestSeller),
+        "BestSeller badge should be detected from span.a-badge-text"
+    );
+}

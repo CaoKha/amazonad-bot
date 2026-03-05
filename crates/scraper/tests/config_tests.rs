@@ -6,7 +6,7 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn set_valid_config_env() {
     unsafe {
-        std::env::set_var("APP__SCRAPER__KEYWORD", "montre connectee");
+        std::env::set_var("APP__SCRAPER__KEYWORDS", "montre connectee,smartwatch");
         std::env::set_var("APP__SCRAPER__MARKETPLACE_URL", "https://www.amazon.fr");
         std::env::set_var("APP__SCRAPER__BRAND_FILTER", "huawei");
         std::env::set_var("APP__TELEGRAM__CHAT_ID", "123456789");
@@ -16,7 +16,7 @@ fn set_valid_config_env() {
 
 fn clear_config_env() {
     unsafe {
-        std::env::remove_var("APP__SCRAPER__KEYWORD");
+        std::env::remove_var("APP__SCRAPER__KEYWORDS");
         std::env::remove_var("APP__SCRAPER__MARKETPLACE_URL");
         std::env::remove_var("APP__SCRAPER__BRAND_FILTER");
         std::env::remove_var("APP__SCRAPER__PAGES");
@@ -33,7 +33,7 @@ fn valid_config() {
 
     let config = load_config().expect("valid config should load successfully");
 
-    assert_eq!(config.scraper.keyword, "montre connectee");
+    assert_eq!(config.scraper.keywords, vec!["montre connectee".to_string(), "smartwatch".to_string()]);
     assert_eq!(config.scraper.marketplace_url, "https://www.amazon.fr");
     assert_eq!(config.scraper.brand_filter, "huawei");
     assert_eq!(config.telegram.chat_id, 123456789);
@@ -63,19 +63,19 @@ fn invalid_chat_id() {
 }
 
 #[test]
-fn empty_keyword() {
+fn empty_keywords_list() {
     let _guard = ENV_LOCK.lock().unwrap();
     clear_config_env();
     set_valid_config_env();
     unsafe {
-        std::env::set_var("APP__SCRAPER__KEYWORD", "");
+        std::env::set_var("APP__SCRAPER__KEYWORDS", ",");
     }
 
     let result = load_config();
     assert!(result.is_err());
     let err_msg = format!("{:#}", result.unwrap_err());
     assert!(
-        err_msg.contains("keyword"),
+        err_msg.contains("keywords"),
         "Error should mention keyword, got: {err_msg}"
     );
 
@@ -210,6 +210,26 @@ fn pages_1_is_valid() {
 
     let result = load_config();
     assert!(result.is_ok(), "pages=1 should be valid");
+
+    clear_config_env();
+}
+
+#[test]
+fn keywords_with_blank_entry_is_invalid() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_config_env();
+    set_valid_config_env();
+    unsafe {
+        std::env::set_var("APP__SCRAPER__KEYWORDS", "valid, ");
+    }
+
+    let result = load_config();
+    assert!(result.is_err());
+    let err_msg = format!("{:#}", result.unwrap_err());
+    assert!(
+        err_msg.contains("keywords"),
+        "Error should mention keywords, got: {err_msg}"
+    );
 
     clear_config_env();
 }

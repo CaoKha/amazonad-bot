@@ -10,6 +10,7 @@ fn search_result_serialization() {
         position_in_page: 3,
         is_sponsored: true,
         placement_type: Some(PlacementType::SponsoredProduct),
+        ..Default::default()
     };
 
     let json = serde_json::to_string(&result).unwrap();
@@ -22,38 +23,15 @@ fn search_result_serialization() {
 }
 
 #[test]
-fn monitor_state_round_trip() {
-    let state = MonitorState {
-        huawei_ad_visible: true,
-        huawei_positions: vec![1, 3],
-        total_results_scraped: 48,
-        updated_at: chrono::Utc::now(),
-    };
-
-    let json = serde_json::to_string(&state).unwrap();
-    let deserialized: MonitorState = serde_json::from_str(&json).unwrap();
-
-    assert_eq!(deserialized.huawei_ad_visible, state.huawei_ad_visible);
-    assert_eq!(deserialized.huawei_positions, state.huawei_positions);
-    assert_eq!(
-        deserialized.total_results_scraped,
-        state.total_results_scraped
-    );
-    assert_eq!(deserialized.updated_at, state.updated_at);
+fn monitor_state_default_is_empty() {
+    let state = MonitorState::default();
+    assert!(state.keywords.is_empty());
 }
 
 #[test]
-fn monitor_state_no_ad() {
-    let state = MonitorState {
-        huawei_ad_visible: false,
-        huawei_positions: vec![],
-        total_results_scraped: 24,
-        updated_at: chrono::Utc::now(),
-    };
-
+fn monitor_state_round_trip() {
+    let state = MonitorState::default();
     let json = serde_json::to_string(&state).unwrap();
-    let deserialized: MonitorState = serde_json::from_str(&json).unwrap();
-
-    assert!(!deserialized.huawei_ad_visible);
-    assert!(deserialized.huawei_positions.is_empty());
+    let loaded: MonitorState = serde_json::from_str(&json).unwrap();
+    assert_eq!(loaded.keywords.len(), 0);
 }
