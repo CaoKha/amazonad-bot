@@ -1,0 +1,18 @@
+[package]
+name = "mts-ads-api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mts-common = { path = "../common" }
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+config = { version = "0.15", features = ["toml"] }
+dotenvy = "0.15"
+reqwest = { version = "0.13", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
