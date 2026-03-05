@@ -1,0 +1,28 @@
+[Unit]
+Description=Amazon Ads Monitor Daemon
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=monitor
+Group=monitor
+WorkingDirectory=/opt/ads-monitor
+ExecStart=/opt/ads-monitor/monitoring-the-situation run
+Restart=always
+RestartSec=10
+Environment=RUST_LOG=info
+EnvironmentFile=-/opt/ads-monitor/.env
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/ads-monitor
+PrivateTmp=true
+# Chrome headless uses ~200-300MB; 512M provides headroom
+MemoryMax=512M
+CPUQuota=20%
+
+[Install]
+WantedBy=multi-user.target
