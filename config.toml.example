@@ -1,0 +1,13 @@
+[scraper]
+keyword = "montre connectee"
+marketplace_url = "https://www.amazon.fr"
+brand_filter = "huawei"
+pages = 3  # Number of search result pages to check (1-7)
+# chrome_executable = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+# (optional — auto-detected on macOS and Linux if not set)
+
+[telegram]
+chat_id = 0  # Your Telegram chat ID
+
+[monitoring]
+interval_minutes = 30
