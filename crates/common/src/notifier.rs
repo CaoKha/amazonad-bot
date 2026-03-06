@@ -14,8 +14,25 @@ pub struct TelegramNotifier {
     search_url: String,
 }
 
+pub type SponsoredEntry = (
+    u32,
+    usize,
+    String,
+    Option<PlacementType>,
+    Option<String>,
+    Option<f32>,
+    Option<u32>,
+    bool,
+    Option<BadgeType>,
+);
+
 impl TelegramNotifier {
-    pub fn new(config: &TelegramConfig, client: reqwest::Client, keyword: String, search_url: String) -> Result<Self> {
+    pub fn new(
+        config: &TelegramConfig,
+        client: reqwest::Client,
+        keyword: String,
+        search_url: String,
+    ) -> Result<Self> {
         let bot_token = std::env::var("TELEGRAM_BOT_TOKEN")
             .context("TELEGRAM_BOT_TOKEN environment variable not set")?;
 
@@ -36,13 +53,17 @@ impl TelegramNotifier {
         &self,
         positions: &[(u32, usize, Option<PlacementType>)],
         sample_title: &str,
-        all_sponsored: &[(u32, usize, String, Option<PlacementType>, Option<String>, Option<f32>, Option<u32>, bool, Option<BadgeType>)],
+        all_sponsored: &[SponsoredEntry],
     ) -> Result<()> {
         let pos_str = positions
             .iter()
             .map(|(page, pos, pt)| {
                 let loc = format_location(*page, *pos);
-                if let Some(pt) = pt { format!("{loc} [{}]", abbreviate_placement(pt)) } else { loc }
+                if let Some(pt) = pt {
+                    format!("{loc} [{}]", abbreviate_placement(pt))
+                } else {
+                    loc
+                }
             })
             .collect::<Vec<_>>()
             .join(", ");
@@ -59,12 +80,22 @@ impl TelegramNotifier {
             )
         } else {
             let mut sponsored_list = String::new();
-            for (page, pos, title, pt, price, rating, review_count, is_prime, badge) in all_sponsored {
+            for (page, pos, title, pt, price, rating, review_count, is_prime, badge) in
+                all_sponsored
+            {
                 let is_brand_match = positions.iter().any(|(p, po, _)| p == page && *po == *pos);
-                sponsored_list.push_str(&format_product_line(
-                    *page, *pos, title, pt.as_ref(), is_brand_match,
-                    price.as_deref(), *rating, *review_count, *is_prime, badge.as_ref(),
-                ));
+                sponsored_list.push_str(&format_product_line(ProductLineArgs {
+                    page: *page,
+                    pos: *pos,
+                    title,
+                    pt: pt.as_ref(),
+                    is_brand_match,
+                    price: price.as_deref(),
+                    rating: *rating,
+                    review_count: *review_count,
+                    is_prime: *is_prime,
+                    badge: badge.as_ref(),
+                }));
                 sponsored_list.push('\n');
             }
             // Remove trailing newline
@@ -111,10 +142,7 @@ impl TelegramNotifier {
     }
 
     async fn send_single_message(&self, text: &str) -> Result<()> {
-        let url = format!(
-            "https://api.telegram.org/bot{}/sendMessage",
-            self.bot_token
-        );
+        let url = format!("https://api.telegram.org/bot{}/sendMessage", self.bot_token);
 
         let body = serde_json::json!({
             "chat_id": self.chat_id,
@@ -162,28 +190,42 @@ fn abbreviate_placement(pt: &PlacementType) -> &'static str {
     }
 }
 
-/// Format a single product line with enrichment data.
-fn format_product_line(
+struct ProductLineArgs<'a> {
     page: u32,
     pos: usize,
-    title: &str,
-    pt: Option<&PlacementType>,
+    title: &'a str,
+    pt: Option<&'a PlacementType>,
     is_brand_match: bool,
-    price: Option<&str>,
+    price: Option<&'a str>,
     rating: Option<f32>,
     review_count: Option<u32>,
     is_prime: bool,
-    badge: Option<&BadgeType>,
-) -> String {
+    badge: Option<&'a BadgeType>,
+}
+
+/// Format a single product line with enrichment data.
+fn format_product_line(args: ProductLineArgs<'_>) -> String {
+    let ProductLineArgs {
+        page,
+        pos,
+        title,
+        pt,
+        is_brand_match,
+        price,
+        rating,
+        review_count,
+        is_prime,
+        badge,
+    } = args;
     let loc = format_location(page, pos);
-    
+
     let mut segments: Vec<String> = Vec::new();
-    
+
     // Placement type tag
     if let Some(pt) = pt {
         segments.push(format!("[{}]", abbreviate_placement(pt)));
     }
-    
+
     // Rating + review count
     if let Some(r) = rating {
         let rating_str = if let Some(count) = review_count {
@@ -195,30 +237,30 @@ fn format_product_line(
     } else if let Some(count) = review_count {
         segments.push(format!("({count})"));
     }
-    
+
     // Price
     if let Some(p) = price {
         segments.push(p.to_string());
     }
-    
+
     // Prime
     if is_prime {
         segments.push("Prime".to_string());
     }
-    
+
     // Badge
     if let Some(b) = badge {
         segments.push(b.to_string());
     }
-    
+
     let meta = if segments.is_empty() {
         String::new()
     } else {
         format!(" {}", segments.join(" | "))
     };
-    
+
     let suffix = if is_brand_match { " ✓" } else { "" };
-    
+
     format!("• {loc}{meta} — {}{suffix}", escape_html(title))
 }
 
@@ -313,11 +355,13 @@ mod tests {
         // Simulate a long ad list message
         let mut msg = String::from("📋 All paid placements (50 total):\n");
         for i in 1..=50 {
-            msg.push_str(&format!("• Page 1 #{i} [Sponsored Product] — Some Product Title Here\n"));
+            msg.push_str(&format!(
+                "• Page 1 #{i} [Sponsored Product] — Some Product Title Here\n"
+            ));
         }
         let chunks = split_message(&msg, 4000);
         // Should produce multiple chunks
-        assert!(chunks.len() >= 1);
+        assert!(!chunks.is_empty());
         // Every chunk should be within limit
         for chunk in &chunks {
             assert!(chunk.len() <= 4000, "Chunk too long: {} bytes", chunk.len());

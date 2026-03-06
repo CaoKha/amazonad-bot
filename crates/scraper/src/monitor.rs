@@ -1,12 +1,12 @@
-use std::sync::Arc;
 use anyhow::Result;
 use chrono::Utc;
+use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::amazon_scraper::AmazonScraper;
 use crate::config::TelegramConfig;
 use mts_common::models::KeywordState;
-use mts_common::notifier::TelegramNotifier;
+use mts_common::notifier::{SponsoredEntry, TelegramNotifier};
 use mts_common::state::StateManager;
 
 pub struct MonitorEngine {
@@ -50,7 +50,11 @@ impl MonitorEngine {
         for keyword in &self.keywords {
             info!("Scraping keyword: '{}'", keyword);
 
-            let scrape_result = match self.scraper.scrape_all_pages_with_browser(&browser, keyword).await {
+            let scrape_result = match self
+                .scraper
+                .scrape_all_pages_with_browser(&browser, keyword)
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!("Scrape failed for keyword '{}': {:#}", keyword, e);
@@ -59,7 +63,10 @@ impl MonitorEngine {
             };
 
             if scrape_result.results.is_empty() {
-                warn!("Keyword '{}': 0 results — possible block, skipping state update", keyword);
+                warn!(
+                    "Keyword '{}': 0 results — possible block, skipping state update",
+                    keyword
+                );
                 continue;
             }
 
@@ -69,16 +76,25 @@ impl MonitorEngine {
                 scrape_result.results.len()
             );
 
-            let prev_ks = state.keywords.get(keyword.as_str()).cloned().unwrap_or_default();
+            let prev_ks = state
+                .keywords
+                .get(keyword.as_str())
+                .cloned()
+                .unwrap_or_default();
 
             // Determine brand visibility
-            let brand_ad_visible = scrape_result.results.iter()
+            let brand_ad_visible = scrape_result
+                .results
+                .iter()
                 .any(|r| r.is_sponsored && r.title.to_lowercase().contains(&brand_lower));
 
-            let brand_positions: Vec<(u32, usize, Option<mts_common::models::PlacementType>)> = scrape_result.results.iter()
-                .filter(|r| r.is_sponsored && r.title.to_lowercase().contains(&brand_lower))
-                .map(|r| (r.page, r.position_in_page, r.placement_type.clone()))
-                .collect();
+            let brand_positions: Vec<(u32, usize, Option<mts_common::models::PlacementType>)> =
+                scrape_result
+                    .results
+                    .iter()
+                    .filter(|r| r.is_sponsored && r.title.to_lowercase().contains(&brand_lower))
+                    .map(|r| (r.page, r.position_in_page, r.placement_type.clone()))
+                    .collect();
 
             let now = Utc::now();
             let last_changed = if brand_ad_visible != prev_ks.brand_ad_visible {
@@ -88,9 +104,7 @@ impl MonitorEngine {
             };
 
             // Send Telegram notification if state changed
-            let search_url = AmazonScraper::build_search_url(
-                &self.marketplace_url, keyword, 1
-            );
+            let search_url = AmazonScraper::build_search_url(&self.marketplace_url, keyword, 1);
             let notifier = match TelegramNotifier::new(
                 &self.telegram_config,
                 self.http_client.clone(),
@@ -99,7 +113,10 @@ impl MonitorEngine {
             ) {
                 Ok(n) => n,
                 Err(e) => {
-                    warn!("Failed to create notifier for keyword '{}': {:#}", keyword, e);
+                    warn!(
+                        "Failed to create notifier for keyword '{}': {:#}",
+                        keyword, e
+                    );
                     // Still update state even if notifier fails
                     let new_ks = KeywordState {
                         brand_ad_visible,
@@ -115,15 +132,19 @@ impl MonitorEngine {
 
             if !prev_ks.brand_ad_visible && brand_ad_visible {
                 info!("Keyword '{}': brand ad APPEARED", keyword);
-                let sample_title = scrape_result.results.iter()
+                let sample_title = scrape_result
+                    .results
+                    .iter()
                     .find(|r| r.is_sponsored && r.title.to_lowercase().contains(&brand_lower))
                     .map(|r| r.title.clone())
                     .unwrap_or_default();
 
-                let all_sponsored: Vec<(u32, usize, String, Option<mts_common::models::PlacementType>, Option<String>, Option<f32>, Option<u32>, bool, Option<mts_common::models::BadgeType>)> =
-                    scrape_result.results.iter()
-                        .filter(|r| r.is_sponsored)
-                        .map(|r| (
+                let all_sponsored: Vec<SponsoredEntry> = scrape_result
+                    .results
+                    .iter()
+                    .filter(|r| r.is_sponsored)
+                    .map(|r| {
+                        (
                             r.page,
                             r.position_in_page,
                             r.title.clone(),
@@ -133,16 +154,26 @@ impl MonitorEngine {
                             r.review_count,
                             r.is_prime,
                             r.badge.clone(),
-                        ))
-                        .collect();
+                        )
+                    })
+                    .collect();
 
-                if let Err(e) = notifier.send_ad_appeared(&brand_positions, &sample_title, &all_sponsored).await {
-                    warn!("Failed to send ad appeared notification for '{}': {:#}", keyword, e);
+                if let Err(e) = notifier
+                    .send_ad_appeared(&brand_positions, &sample_title, &all_sponsored)
+                    .await
+                {
+                    warn!(
+                        "Failed to send ad appeared notification for '{}': {:#}",
+                        keyword, e
+                    );
                 }
             } else if prev_ks.brand_ad_visible && !brand_ad_visible {
                 info!("Keyword '{}': brand ad DISAPPEARED", keyword);
                 if let Err(e) = notifier.send_ad_disappeared().await {
-                    warn!("Failed to send ad disappeared notification for '{}': {:#}", keyword, e);
+                    warn!(
+                        "Failed to send ad disappeared notification for '{}': {:#}",
+                        keyword, e
+                    );
                 }
             } else {
                 info!(

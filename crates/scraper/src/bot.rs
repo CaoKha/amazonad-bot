@@ -38,6 +38,7 @@ pub struct CommandListener {
     client: reqwest::Client,
     bot_token: String,
     chat_id: i64,
+    #[allow(dead_code)]
     scraper: Arc<AmazonScraper>,
     state_manager: Arc<StateManager>,
     brand_filter: String,
@@ -109,10 +110,7 @@ impl CommandListener {
                 };
 
                 if message.chat.id != self.chat_id {
-                    warn!(
-                        "Ignoring message from unknown chat_id: {}",
-                        message.chat.id
-                    );
+                    warn!("Ignoring message from unknown chat_id: {}", message.chat.id);
                     continue;
                 }
 
@@ -134,9 +132,7 @@ impl CommandListener {
                     "/status" => self.handle_status().await,
                     "/check" => self.handle_check().await,
                     "/list" => self.handle_list().await,
-                    "/filter" => {
-                        self.handle_filter(&text).await
-                    }
+                    "/filter" => self.handle_filter(&text).await,
                     _ => {}
                 }
             }
@@ -346,10 +342,7 @@ impl CommandListener {
                                 .as_ref()
                                 .map(|t| format!(" [{t}]"))
                                 .unwrap_or_default();
-                            text.push_str(&format!(
-                                "• {loc}{tag} — {}\n",
-                                escape_html(&r.title)
-                            ));
+                            text.push_str(&format!("• {loc}{tag} — {}\n", escape_html(&r.title)));
                         }
                         let remaining = sponsored.len().saturating_sub(15);
                         if remaining > 0 {
@@ -359,10 +352,7 @@ impl CommandListener {
                     }
                 }
                 None => {
-                    text.push_str(&format!(
-                        "\n<b>{}</b>: not yet checked\n",
-                        escape_html(kw)
-                    ));
+                    text.push_str(&format!("\n<b>{}</b>: not yet checked\n", escape_html(kw)));
                 }
             }
         }
@@ -431,10 +421,7 @@ impl CommandListener {
                             .as_ref()
                             .map(|t| format!(" [{t}]"))
                             .unwrap_or_default();
-                        text.push_str(&format!(
-                            "• {loc}{tag} — {}\n",
-                            escape_html(&r.title)
-                        ));
+                        text.push_str(&format!("• {loc}{tag} — {}\n", escape_html(&r.title)));
                     }
                     total += matched.len();
                 }
@@ -470,20 +457,14 @@ impl CommandListener {
             while !remaining.is_char_boundary(end) {
                 end -= 1;
             }
-            let split_at = remaining[..end]
-                .rfind('\n')
-                .map(|p| p + 1)
-                .unwrap_or(end);
+            let split_at = remaining[..end].rfind('\n').map(|p| p + 1).unwrap_or(end);
             self.send_single_reply(&remaining[..split_at]).await;
             remaining = &remaining[split_at..];
         }
     }
 
     async fn send_single_reply(&self, text: &str) {
-        let url = format!(
-            "https://api.telegram.org/bot{}/sendMessage",
-            self.bot_token
-        );
+        let url = format!("https://api.telegram.org/bot{}/sendMessage", self.bot_token);
 
         let body = serde_json::json!({
             "chat_id": self.chat_id,
