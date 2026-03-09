@@ -86,13 +86,17 @@ impl MonitorEngine {
             let brand_ad_visible = scrape_result
                 .results
                 .iter()
-                .any(|r| r.is_sponsored && r.title.to_lowercase().contains(&brand_lower));
+                .any(|r| {
+                    r.is_sponsored
+                        && (r.title.to_lowercase().contains(&brand_lower)
+                            || r.brand.as_ref().map_or(false, |b| b.to_lowercase().contains(&brand_lower)))
+                });
 
             let brand_positions: Vec<(u32, usize, Option<mts_common::models::PlacementType>)> =
                 scrape_result
                     .results
                     .iter()
-                    .filter(|r| r.is_sponsored && r.title.to_lowercase().contains(&brand_lower))
+                    .filter(|r| r.is_sponsored && (r.title.to_lowercase().contains(&brand_lower) || r.brand.as_ref().map_or(false, |b| b.to_lowercase().contains(&brand_lower))))
                     .map(|r| (r.page, r.position_in_page, r.placement_type.clone()))
                     .collect();
 
@@ -135,7 +139,7 @@ impl MonitorEngine {
                 let sample_title = scrape_result
                     .results
                     .iter()
-                    .find(|r| r.is_sponsored && r.title.to_lowercase().contains(&brand_lower))
+                    .find(|r| r.is_sponsored && (r.title.to_lowercase().contains(&brand_lower) || r.brand.as_ref().map_or(false, |b| b.to_lowercase().contains(&brand_lower))))
                     .map(|r| r.title.clone())
                     .unwrap_or_default();
 

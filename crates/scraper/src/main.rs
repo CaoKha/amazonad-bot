@@ -92,6 +92,9 @@ async fn cmd_run() -> anyhow::Result<()> {
         tokio::time::interval(Duration::from_secs(config.monitoring.interval_minutes * 60));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+
     loop {
         tokio::select! {
             _ = interval.tick() => {
@@ -100,8 +103,7 @@ async fn cmd_run() -> anyhow::Result<()> {
                     Err(e) => tracing::error!("Sweep failed: {e:#}"),
                 }
             }
-            _ = tokio::signal::ctrl_c() => {
-                info!("Shutdown signal received. Exiting.");
+            _ = &mut shutdown => {
                 break;
             }
         }
@@ -159,4 +161,27 @@ async fn cmd_dry_run() -> anyhow::Result<()> {
     info!("\nAll checks passed. Ready to run: cargo run -p mts-scraper -- run");
 
     Ok(())
+}
+
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("SIGINT received. Shutting down.");
+            }
+            _ = sigterm.recv() => {
+                info!("SIGTERM received. Shutting down.");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.ok();
+        info!("Shutdown signal received.");
+    }
 }

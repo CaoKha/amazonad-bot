@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use rand::Rng;
 use scraper::{Element, Html, Selector};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::ScraperConfig;
 use mts_common::models::{BadgeType, PlacementType, ScrapeResult, SearchResult};
@@ -78,6 +78,9 @@ impl AmazonScraper {
                 BrowserConfig::builder()
                     .chrome_executable(chrome_path)
                     .no_sandbox()
+                    .arg("--disable-blink-features=AutomationControlled")
+                    .arg("--disable-dev-shm-usage")
+                    .arg("--window-size=1920,1080")
                     .build()
                     .map_err(|e| anyhow::anyhow!("Failed to build BrowserConfig: {}", e))?,
             ),
@@ -110,9 +113,12 @@ impl AmazonScraper {
             );
             debug!("Scraping page {}/{}: {}", page_num, self.config.pages, url);
 
+            // Create blank page first — stealth scripts registered via
+            // AddScriptToEvaluateOnNewDocument only fire on SUBSEQUENT navigations,
+            // so they must be applied BEFORE navigating to Amazon.
             let page = match tokio::time::timeout(
-                std::time::Duration::from_secs(45),
-                browser.new_page(&url),
+                std::time::Duration::from_secs(15),
+                browser.new_page("about:blank"),
             )
             .await
             {
@@ -126,17 +132,48 @@ impl AmazonScraper {
                 }
                 Err(_) => {
                     if page_num == 1 {
+                        bail!("Page creation timed out");
+                    }
+                    warn!("Page {} creation timed out, stopping", page_num);
+                    break;
+                }
+            };
+
+            // Apply all stealth patches BEFORE navigating to Amazon
+            if let Err(e) = page.enable_stealth_mode_with_agent(MODERN_UA).await {
+                warn!("Stealth mode failed on page {}: {}", page_num, e);
+            }
+            if let Err(e) = inject_extra_stealth(&page, MODERN_UA).await {
+                warn!("Extra stealth injection failed on page {}: {}", page_num, e);
+            }
+
+            // NOW navigate to the actual Amazon URL
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(45),
+                page.goto(&url),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    drop(page);
+                    if page_num == 1 {
+                        return Err(anyhow::anyhow!("{}", e)).context("Failed to navigate to page");
+                    }
+                    warn!("Page {} navigation failed: {}", page_num, e);
+                    break;
+                }
+                Err(_) => {
+                    drop(page);
+                    if page_num == 1 {
                         bail!("Page navigation timed out");
                     }
                     warn!("Page {} navigation timed out, stopping", page_num);
                     break;
                 }
-            };
-
-            if let Err(e) = page.enable_stealth_mode_with_agent(MODERN_UA).await {
-                warn!("Stealth mode failed on page {}: {}", page_num, e);
             }
 
+            // Wait for search results to appear
             let js_check =
                 r#"document.querySelector('div[data-component-type="s-search-result"]') !== null"#;
 
@@ -159,6 +196,11 @@ impl AmazonScraper {
             .await
             .unwrap_or(false);
 
+            // Give Amazon's ad-decoration JS time to apply AdHolder classes
+            // and sponsored markers to the DOM after results render.
+            if results_appeared {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
             if !results_appeared {
                 let url_after = page
                     .url()
@@ -196,6 +238,16 @@ impl AmazonScraper {
                 }
             };
             drop(page);
+
+            // Dump HTML for inspection when DUMP_HTML env var is set
+            if std::env::var("DUMP_HTML").is_ok() {
+                let dump_path = format!("dump_page{}_{}.html", page_num, keyword.replace(' ', "_"));
+                if let Err(e) = std::fs::write(&dump_path, &html) {
+                    warn!("Failed to dump HTML to {}: {}", dump_path, e);
+                } else {
+                    info!("Dumped HTML to {}", dump_path);
+                }
+            }
 
             let page_result = Self::parse_results_with_offset(
                 &html,
@@ -264,7 +316,7 @@ impl AmazonScraper {
         static SB_BRAND_LABEL_SEL: LazyLock<Selector> = LazyLock::new(||
             Selector::parse(".sponsored-brand-label-info-desktop").unwrap());
         static SB_VIDEO_SEL: LazyLock<Selector> = LazyLock::new(||
-            Selector::parse(r#"div[data-component-type="sbv-video"]"#).unwrap());
+            Selector::parse(r#"div[data-component-type="sbv-video"], [data-component-type="sbv-video-single-product"]"#).unwrap());
         static TOP_SLOT_SEL: LazyLock<Selector> = LazyLock::new(||
             Selector::parse(r#"span[data-component-type="s-top-slot"]"#).unwrap());
         // Enrichment selectors
@@ -274,6 +326,7 @@ impl AmazonScraper {
         static PRIME_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("i.a-icon-prime").unwrap());
         static BADGE_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("span.a-badge-text").unwrap());
         static BRAND_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("span.a-size-base.a-color-secondary").unwrap());
+        static LINK_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("a[href]").unwrap());
 
         let document = Html::parse_document(html);
         let brand_lower = brand_filter.to_lowercase();
@@ -288,7 +341,7 @@ impl AmazonScraper {
             .filter_map(|el| el.value().attr("data-asin").map(String::from))
             .collect();
 
-        debug!(
+        info!(
             "parse page={} result_count={} sp_sponsored_count={} adholder_count={}",
             page,
             document.select(&RESULT_SEL).count(),
@@ -338,18 +391,6 @@ impl AmazonScraper {
                 || has_sponsored_text
                 || has_sponsored_class;
 
-            if pos_in_page <= 5 {
-                debug!(
-                    "result page={} pos={} asin={} title_len={} sp={} adholder={} text_sp={} class_sp={} => is_sponsored={}",
-                    page, pos_in_page, asin, title.len(),
-                    sponsored_asins.contains(&asin),
-                    adholder_asins.contains(&asin),
-                    has_sponsored_text,
-                    has_sponsored_class,
-                    is_sponsored,
-                );
-            }
-
             // === Enrichment fields ===
             let price = element.select(&PRICE_SEL).next()
                 .map(|el| el.text().collect::<String>().trim().to_string())
@@ -389,6 +430,20 @@ impl AmazonScraper {
             let brand = element.select(&BRAND_SEL).next()
                 .map(|el| el.text().collect::<String>().trim().to_string())
                 .filter(|s| !s.is_empty());
+
+            if pos_in_page <= 5 {
+                info!(
+                    "result page={} pos={} asin={} title={:?} brand={:?} sp={} adholder={} text_sp={} class_sp={} => is_sponsored={}",
+                    page, pos_in_page, asin,
+                    &title[..title.len().min(60)],
+                    brand.as_deref().unwrap_or("-"),
+                    sponsored_asins.contains(&asin),
+                    adholder_asins.contains(&asin),
+                    has_sponsored_text,
+                    has_sponsored_class,
+                    is_sponsored,
+                );
+            }
 
             results.push(SearchResult {
                 asin,
@@ -488,28 +543,65 @@ impl AmazonScraper {
         }
 
         // Method 2: Look for sbv-video containers (Sponsored Brands Video)
-        for video_div in document.select(&SB_VIDEO_SEL) {
+        for video_el in document.select(&SB_VIDEO_SEL) {
             // SB Video containers typically have product info and ASIN
-            let asin = video_div.value().attr("data-asin")
-                .or_else(|| video_div.value().attr("data-csa-c-asin"))
+            let direct_asin = video_el.value().attr("data-asin")
+                .or_else(|| video_el.value().attr("data-csa-c-asin"))
                 .unwrap_or("").to_string();
-            if asin.is_empty() || already_seen_sb.contains(&asin) { continue; }
-            let title = video_div.select(&H2_SEL)
+            let title = video_el.select(&H2_SEL)
                 .next()
                 .map(|h| h.text().collect::<String>().trim().to_string())
                 .unwrap_or_default();
-            if title.is_empty() { continue; }
-            results.push(SearchResult {
-                asin,
-                title,
-                position: 0,
-                page,
-                position_in_page: 0,
-                is_sponsored: true,
-                placement_type: Some(PlacementType::SponsoredBrandVideo),
-                ..Default::default()
-            });
-            sb_added += 1;
+
+            if !direct_asin.is_empty() && !already_seen_sb.contains(&direct_asin) {
+                if !title.is_empty() {
+                    results.push(SearchResult {
+                        asin: direct_asin,
+                        title,
+                        position: 0,
+                        page,
+                        position_in_page: 0,
+                        is_sponsored: true,
+                        placement_type: Some(PlacementType::SponsoredBrandVideo),
+                        ..Default::default()
+                    });
+                    sb_added += 1;
+                }
+            } else if direct_asin.is_empty() {
+                // Fallback: extract ASINs from /dp/ links (sbv-video-single-product containers)
+                let mut seen_in_sbv: HashSet<String> = HashSet::new();
+                for link in video_el.select(&LINK_SEL) {
+                    let href = match link.value().attr("href") {
+                        Some(h) => h,
+                        None => continue,
+                    };
+                    let dp_asin = match extract_asin_from_dp_link(href) {
+                        Some(a) => a,
+                        None => continue,
+                    };
+                    if already_seen_sb.contains(&dp_asin) || seen_in_sbv.contains(&dp_asin) {
+                        continue;
+                    }
+                    seen_in_sbv.insert(dp_asin.clone());
+                    let link_title = if !title.is_empty() {
+                        title.clone()
+                    } else {
+                        link.text().collect::<String>().trim().to_string()
+                    };
+                    if link_title.is_empty() { continue; }
+                    results.push(SearchResult {
+                        asin: dp_asin,
+                        title: link_title,
+                        position: 0,
+                        page,
+                        position_in_page: 0,
+                        is_sponsored: true,
+                        placement_type: Some(PlacementType::SponsoredBrandVideo),
+                        ..Default::default()
+                    });
+                    sb_added += 1;
+                }
+            }
         }
         debug!("parse page={} sponsored_brand_added={}", page, sb_added);
 
@@ -549,10 +641,27 @@ impl AmazonScraper {
 
         let huawei_sponsored: Vec<&SearchResult> = results
             .iter()
-            .filter(|r| r.is_sponsored && r.title.to_lowercase().contains(&brand_lower))
+            .filter(|r| {
+                r.is_sponsored
+                    && (r.title.to_lowercase().contains(&brand_lower)
+                        || r.brand.as_ref().map_or(false, |b| b.to_lowercase().contains(&brand_lower)))
+            })
             .collect();
 
         let huawei_sponsored_found = !huawei_sponsored.is_empty();
+        let sponsored_count = results.iter().filter(|r| r.is_sponsored).count();
+        info!(
+            "parse page={} total_results={} sponsored={} brand_match={}",
+            page, results.len(), sponsored_count, huawei_sponsored.len()
+        );
+        for r in &huawei_sponsored {
+            info!(
+                "  brand_match: asin={} title={:?} brand={:?} placement={:?}",
+                r.asin, &r.title[..r.title.len().min(60)],
+                r.brand.as_deref().unwrap_or("-"),
+                r.placement_type
+            );
+        }
         let mut huawei_sponsored_positions: Vec<usize> =
             huawei_sponsored.iter().map(|r| r.position).collect();
         huawei_sponsored_positions.dedup();
@@ -605,3 +714,128 @@ fn find_asin_in_ancestors(el: &scraper::ElementRef) -> Option<String> {
     }
     None
 }
+
+
+/// Extract ASIN from an Amazon `/dp/ASIN` link.
+fn extract_asin_from_dp_link(href: &str) -> Option<String> {
+    let idx = href.find("/dp/")?;
+    let after = &href[idx + 4..];
+    let asin = after.split(['/', '?', '#', '&']).next()?;
+    if asin.is_empty() { return None; }
+    Some(asin.to_string())
+}
+
+
+/// Inject additional stealth patches beyond chromiumoxide's built-in stealth mode.
+///
+/// The built-in `enable_stealth_mode_with_agent` covers:
+///   - navigator.webdriver = false
+///   - navigator.plugins (5 PDF plugins)
+///   - navigator.permissions.query
+///   - WebGL vendor/renderer
+///   - window.chrome = { runtime: {} }
+///
+/// This function adds patches for detection vectors Amazon specifically checks:
+///   - Accept-Language header (must match marketplace locale)
+///   - navigator.languages (empty = headless)
+///   - navigator.hardwareConcurrency (1-2 = headless)
+///   - navigator.deviceMemory
+///   - Screen dimension consistency
+///   - iframe contentWindow.navigator.webdriver leak
+async fn inject_extra_stealth(page: &chromiumoxide::Page, ua: &str) -> Result<()> {
+    use chromiumoxide_cdp::cdp::browser_protocol::
+        page::AddScriptToEvaluateOnNewDocumentParams;
+    use chromiumoxide_cdp::cdp::browser_protocol::
+        network::SetUserAgentOverrideParams;
+
+    // Override User-Agent with Accept-Language header for French Amazon.
+    // Without this, Chrome sends no Accept-Language which is a bot signal.
+    let mut ua_params = SetUserAgentOverrideParams::new(ua.to_string());
+    ua_params.accept_language = Some("fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7".to_string());
+    ua_params.platform = Some("macOS".to_string());
+    page.execute(ua_params).await?;
+
+    // Inject supplementary stealth JavaScript that runs before any page scripts.
+    page.execute(AddScriptToEvaluateOnNewDocumentParams {
+        source: EXTRA_STEALTH_JS.to_string(),
+        world_name: None,
+        include_command_line_api: None,
+        run_immediately: None,
+    })
+    .await?;
+
+    Ok(())
+}
+
+/// Stealth JavaScript patches injected via Page.addScriptToEvaluateOnNewDocument.
+/// Runs before ANY page scripts on every navigation.
+const EXTRA_STEALTH_JS: &str = r#"
+    // navigator.languages — Amazon checks this is non-empty and locale-consistent.
+    // Headless Chrome returns an empty array by default.
+    Object.defineProperty(Object.getPrototypeOf(navigator), 'languages', {
+        get: () => Object.freeze(['fr-FR', 'fr', 'en-US', 'en'])
+    });
+
+    // navigator.hardwareConcurrency — headless often reports 1-2 cores which is suspicious.
+    Object.defineProperty(Object.getPrototypeOf(navigator), 'hardwareConcurrency', {
+        get: () => 8
+    });
+
+    // navigator.deviceMemory — should match a plausible real device.
+    if ('deviceMemory' in navigator) {
+        Object.defineProperty(Object.getPrototypeOf(navigator), 'deviceMemory', {
+            get: () => 8
+        });
+    }
+
+    // navigator.maxTouchPoints — desktop browsers report 0.
+    Object.defineProperty(Object.getPrototypeOf(navigator), 'maxTouchPoints', {
+        get: () => 0
+    });
+
+    // Notification.permission — headless defaults to 'denied', real browsers to 'default'.
+    if (typeof Notification !== 'undefined') {
+        Object.defineProperty(Notification, 'permission', {
+            get: () => 'default',
+            configurable: true
+        });
+    }
+
+    // navigator.connection — fake Network Information API.
+    // Missing entirely in headless is a detection signal.
+    if (!('connection' in navigator)) {
+        Object.defineProperty(Object.getPrototypeOf(navigator), 'connection', {
+            get: () => ({
+                effectiveType: '4g',
+                rtt: 50,
+                downlink: 10,
+                saveData: false
+            })
+        });
+    }
+
+    // Screen dimensions — headless often has outerWidth/outerHeight = 0.
+    if (window.outerWidth === 0) {
+        Object.defineProperty(window, 'outerWidth', { get: () => window.innerWidth });
+        Object.defineProperty(window, 'outerHeight', { get: () => window.innerHeight + 85 });
+    }
+
+    // iframe contentWindow.navigator.webdriver leak prevention.
+    // Even with navigator.webdriver patched, iframes may leak the real value.
+    const origCW = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentWindow');
+    if (origCW && origCW.get) {
+        Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
+            get: function() {
+                const win = origCW.get.call(this);
+                if (win) {
+                    try {
+                        Object.defineProperty(win.navigator, 'webdriver', {
+                            get: () => false
+                        });
+                    } catch(e) {}
+                }
+                return win;
+            }
+        });
+    }
+"#;

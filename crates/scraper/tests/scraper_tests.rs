@@ -577,3 +577,124 @@ fn best_seller_badge_detected() {
         "BestSeller badge should be detected from span.a-badge-text"
     );
 }
+
+
+const HTML_SBV_VIDEO_SINGLE_PRODUCT: &str = r#"
+<!DOCTYPE html>
+<html>
+<body>
+<div data-component-type="s-search-result" data-asin="B0APPLE001">
+  <h2>Apple Watch Series 9</h2>
+</div>
+<span data-component-type="sbv-video-single-product">
+  <span class="sponsored-brand-label-info-desktop">Sponsored</span>
+  <h2>Soft Silicone Strap for Huawei Band 8/9/10</h2>
+  <a href="/dp/B0F2ZZDMX7/ref=some_ref">Product Link</a>
+</span>
+</body>
+</html>
+"#;
+
+#[test]
+fn sbv_video_single_product_detected() {
+    let result = AmazonScraper::parse_results(HTML_SBV_VIDEO_SINGLE_PRODUCT, "huawei");
+
+    let sbv = result
+        .results
+        .iter()
+        .find(|r| r.asin == "B0F2ZZDMX7")
+        .expect("SBV product should be found via /dp/ link extraction");
+    assert!(sbv.is_sponsored, "SBV product must be sponsored");
+    assert!(
+        sbv.title.contains("Huawei"),
+        "Title should contain Huawei, got: {}",
+        sbv.title
+    );
+    assert_eq!(
+        sbv.placement_type,
+        Some(mts_common::models::PlacementType::SponsoredBrandVideo),
+        "Placement type should be SponsoredBrandVideo"
+    );
+
+    assert!(
+        result.huawei_sponsored_found,
+        "Huawei sponsored should be detected in SBV section"
+    );
+}
+
+const HTML_SBV_VIDEO_LEGACY: &str = r#"
+<!DOCTYPE html>
+<html>
+<body>
+<div data-component-type="s-search-result" data-asin="B0APPLE001">
+  <h2>Apple Watch Series 9</h2>
+</div>
+<div data-component-type="sbv-video" data-asin="B0HUAWEI01">
+  <h2>HUAWEI Watch GT 5 Pro</h2>
+</div>
+</body>
+</html>
+"#;
+
+#[test]
+fn sbv_video_legacy_format_still_works() {
+    let result = AmazonScraper::parse_results(HTML_SBV_VIDEO_LEGACY, "huawei");
+
+    let sbv = result
+        .results
+        .iter()
+        .find(|r| r.asin == "B0HUAWEI01")
+        .expect("Legacy SBV product should still be detected via data-asin");
+    assert!(sbv.is_sponsored);
+    assert_eq!(
+        sbv.placement_type,
+        Some(mts_common::models::PlacementType::SponsoredBrandVideo),
+    );
+    assert!(result.huawei_sponsored_found);
+}
+
+const HTML_BRAND_FIELD_ONLY: &str = r#"
+<!DOCTYPE html>
+<html>
+<body>
+<div data-component-type="s-search-result" data-asin="B0GGJB61JQ" class="sg-col AdHolder">
+  <div data-component-type="s-impression-logger">
+    <span class="puis-label-popover puis-sponsored-label-text">
+      <a href="javascript:void(0)"><span class="a-color-secondary">Sponsored</span></a>
+    </span>
+    <h2>Smart Watch Band 11 Fitness Tracker</h2>
+    <span class="a-size-base a-color-secondary">HUAWEI</span>
+  </div>
+</div>
+<div data-component-type="s-search-result" data-asin="B0APPLE001">
+  <h2>Apple Watch Series 9</h2>
+</div>
+</body>
+</html>
+"#;
+
+#[test]
+fn brand_field_matches_even_when_title_has_no_brand() {
+    let result = AmazonScraper::parse_results(HTML_BRAND_FIELD_ONLY, "huawei");
+
+    let hw = result
+        .results
+        .iter()
+        .find(|r| r.asin == "B0GGJB61JQ")
+        .unwrap();
+    assert!(hw.is_sponsored, "AdHolder should mark as sponsored");
+    assert!(
+        !hw.title.to_lowercase().contains("huawei"),
+        "Title should NOT contain huawei for this test case"
+    );
+    assert_eq!(
+        hw.brand.as_deref(),
+        Some("HUAWEI"),
+        "Brand field should be extracted from span.a-size-base.a-color-secondary"
+    );
+
+    assert!(
+        result.huawei_sponsored_found,
+        "Should detect Huawei sponsored via brand field even when title lacks 'huawei'"
+    );
+}

@@ -8,6 +8,7 @@ mts-common = { path = "../common" }
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 chromiumoxide = "0.9"
+chromiumoxide_cdp = "0.9"
 clap = { version = "4", features = ["derive"] }
 config = { version = "0.15", features = ["toml"] }
 dotenvy = "0.15"
