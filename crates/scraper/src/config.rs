@@ -9,7 +9,7 @@ pub struct AppConfig {
     #[serde(default)]
     pub database: Option<DatabaseConfig>,
     pub scraper: ScraperConfig,
-    pub telegram: TelegramConfig,
+    pub telegram: Vec<TelegramConfig>,
     pub monitoring: MonitoringConfig,
 }
 
@@ -62,8 +62,13 @@ pub fn load_config() -> Result<AppConfig> {
         "Failed to deserialize configuration. Check config.toml and environment variables.",
     )?;
 
-    if app_config.telegram.chat_id == 0 {
-        bail!("telegram.chat_id must be set (got 0). See README for how to find your chat ID.");
+    if app_config.telegram.is_empty() {
+        bail!("telegram must contain at least one target.");
+    }
+    for tg in &app_config.telegram {
+        if tg.chat_id == 0 {
+            bail!("telegram.chat_id must be set (got 0). See README for how to find your chat ID.");
+        }
     }
     if app_config.scraper.marketplaces.is_empty() {
         bail!("scraper.marketplaces must contain at least one marketplace.");

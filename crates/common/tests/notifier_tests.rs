@@ -12,7 +12,10 @@ fn new_fails_without_bot_token() {
         std::env::remove_var("TELEGRAM_BOT_TOKEN");
     }
 
-    let config = TelegramConfig { chat_id: 123456789 };
+    let config = TelegramConfig {
+        chat_id: 123456789,
+        bot_token_env: "TELEGRAM_BOT_TOKEN".to_string(),
+    };
     let result = TelegramNotifier::new(
         &config,
         reqwest::Client::new(),
@@ -38,7 +41,10 @@ fn new_succeeds_with_valid_token() {
         );
     }
 
-    let config = TelegramConfig { chat_id: 123456789 };
+    let config = TelegramConfig {
+        chat_id: 123456789,
+        bot_token_env: "TELEGRAM_BOT_TOKEN".to_string(),
+    };
     let result = TelegramNotifier::new(
         &config,
         reqwest::Client::new(),
@@ -59,7 +65,10 @@ fn new_fails_with_empty_token() {
         std::env::set_var("TELEGRAM_BOT_TOKEN", "");
     }
 
-    let config = TelegramConfig { chat_id: 123456789 };
+    let config = TelegramConfig {
+        chat_id: 123456789,
+        bot_token_env: "TELEGRAM_BOT_TOKEN".to_string(),
+    };
     let result = TelegramNotifier::new(
         &config,
         reqwest::Client::new(),

@@ -15,7 +15,7 @@ pub struct MonitorEngine {
     scraper: Arc<AmazonScraper>,
     state_manager: Arc<StateManager>,
     http_client: reqwest::Client,
-    telegram_config: Arc<TelegramConfig>,
+    telegram_configs: Arc<Vec<TelegramConfig>>,
     brand_filter: String,
     db_pool: Option<PgPool>,
     shutdown: Arc<AtomicBool>,
@@ -26,7 +26,7 @@ impl MonitorEngine {
         scraper: Arc<AmazonScraper>,
         state_manager: Arc<StateManager>,
         http_client: reqwest::Client,
-        telegram_config: Arc<TelegramConfig>,
+        telegram_configs: Arc<Vec<TelegramConfig>>,
         brand_filter: String,
         db_pool: Option<PgPool>,
         shutdown: Arc<AtomicBool>,
@@ -35,7 +35,7 @@ impl MonitorEngine {
             scraper,
             state_manager,
             http_client,
-            telegram_config,
+            telegram_configs,
             brand_filter,
             db_pool,
             shutdown,
@@ -161,31 +161,45 @@ impl MonitorEngine {
                 prev_ks.last_changed
             };
 
-            // Send Telegram notification if state changed
+            // Build notifiers for all telegram targets
             let search_url = AmazonScraper::build_search_url(&marketplace.url, keyword, 1);
-            let notifier = match TelegramNotifier::new(
-                &self.telegram_config,
-                self.http_client.clone(),
-                keyword.clone(),
-                search_url,
-            ) {
-                Ok(n) => n,
-                Err(e) => {
-                    warn!(
-                        "[{}] Failed to create notifier for keyword '{}': {:#}",
-                        marketplace.code, keyword, e
-                    );
-                    let new_ks = KeywordState {
-                        brand_ad_visible,
-                        brand_positions,
-                        last_changed,
-                        last_checked: Some(now),
-                        last_results: scrape_result.results,
-                    };
-                    state.keywords.insert(state_key, new_ks);
-                    continue;
-                }
-            };
+            let notifiers: Vec<TelegramNotifier> = self
+                .telegram_configs
+                .iter()
+                .filter_map(|tg| {
+                    match TelegramNotifier::new(
+                        tg,
+                        self.http_client.clone(),
+                        keyword.clone(),
+                        search_url.clone(),
+                    ) {
+                        Ok(n) => Some(n),
+                        Err(e) => {
+                            warn!(
+                                "[{}] Failed to create notifier for chat_id={}: {:#}",
+                                marketplace.code, tg.chat_id, e
+                            );
+                            None
+                        }
+                    }
+                })
+                .collect();
+
+            if notifiers.is_empty() {
+                warn!(
+                    "[{}] No working notifiers — skipping notifications for '{}'",
+                    marketplace.code, keyword
+                );
+                let new_ks = KeywordState {
+                    brand_ad_visible,
+                    brand_positions,
+                    last_changed,
+                    last_checked: Some(now),
+                    last_results: scrape_result.results,
+                };
+                state.keywords.insert(state_key, new_ks);
+                continue;
+            }
 
             if !prev_ks.brand_ad_visible && brand_ad_visible {
                 info!(
@@ -224,25 +238,29 @@ impl MonitorEngine {
                     })
                     .collect();
 
-                if let Err(e) = notifier
-                    .send_ad_appeared(&brand_positions, &sample_title, &all_sponsored)
-                    .await
-                {
-                    warn!(
-                        "[{}] Failed to send ad appeared notification for '{}': {:#}",
-                        marketplace.code, keyword, e
-                    );
+                for notifier in &notifiers {
+                    if let Err(e) = notifier
+                        .send_ad_appeared(&brand_positions, &sample_title, &all_sponsored)
+                        .await
+                    {
+                        warn!(
+                            "[{}] Failed to send ad appeared notification for '{}': {:#}",
+                            marketplace.code, keyword, e
+                        );
+                    }
                 }
             } else if prev_ks.brand_ad_visible && !brand_ad_visible {
                 info!(
                     "[{}] Keyword '{}': brand ad DISAPPEARED",
                     marketplace.code, keyword
                 );
-                if let Err(e) = notifier.send_ad_disappeared().await {
-                    warn!(
-                        "[{}] Failed to send ad disappeared notification for '{}': {:#}",
-                        marketplace.code, keyword, e
-                    );
+                for notifier in &notifiers {
+                    if let Err(e) = notifier.send_ad_disappeared().await {
+                        warn!(
+                            "[{}] Failed to send ad disappeared notification for '{}': {:#}",
+                            marketplace.code, keyword, e
+                        );
+                    }
                 }
             } else {
                 info!(

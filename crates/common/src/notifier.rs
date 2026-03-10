@@ -33,8 +33,8 @@ impl TelegramNotifier {
         keyword: String,
         search_url: String,
     ) -> Result<Self> {
-        let bot_token = std::env::var("TELEGRAM_BOT_TOKEN")
-            .context("TELEGRAM_BOT_TOKEN environment variable not set")?;
+        let bot_token = std::env::var(&config.bot_token_env)
+            .with_context(|| format!("{} environment variable not set", config.bot_token_env))?;
 
         if bot_token.is_empty() {
             bail!("TELEGRAM_BOT_TOKEN is empty");

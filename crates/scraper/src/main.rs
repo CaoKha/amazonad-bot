@@ -60,7 +60,7 @@ async fn cmd_run() -> anyhow::Result<()> {
         config.scraper.clone(),
     ))?);
     let state_manager = Arc::new(state::StateManager::new(PathBuf::from("state.json")));
-    let telegram_config = Arc::new(config.telegram.clone());
+    let telegram_configs = Arc::new(config.telegram.clone());
 
     // Connect to Postgres if DATABASE_URL is configured
     let db_pool = match config.database_url() {
@@ -98,7 +98,7 @@ async fn cmd_run() -> anyhow::Result<()> {
         scraper.clone(),
         state_manager.clone(),
         http_client.clone(),
-        telegram_config,
+        telegram_configs.clone(),
         config.scraper.brand_filter.clone(),
         db_pool,
         shutdown_flag.clone(),
@@ -110,10 +110,12 @@ async fn cmd_run() -> anyhow::Result<()> {
         .marketplaces
         .first()
         .expect("at least one marketplace required (validated in load_config)");
-    let bot_token = std::env::var("TELEGRAM_BOT_TOKEN").expect("TELEGRAM_BOT_TOKEN must be set");
+    let first_tg = &config.telegram[0];
+    let bot_token = std::env::var(&first_tg.bot_token_env)
+        .unwrap_or_else(|_| panic!("{} must be set", first_tg.bot_token_env));
     let listener = bot::CommandListener::new(
         bot_token,
-        config.telegram.chat_id,
+        first_tg.chat_id,
         scraper.clone(),
         state_manager.clone(),
         config.scraper.brand_filter.clone(),
@@ -139,10 +141,17 @@ async fn cmd_run() -> anyhow::Result<()> {
         tokio::time::interval(Duration::from_secs(config.monitoring.interval_minutes * 60));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    let shutdown = shutdown_signal(shutdown_flag.clone());
-    tokio::pin!(shutdown);
+    // Spawn signal handler so it runs concurrently — sets shutdown_flag
+    // even while we're deep inside a marketplace sweep.
+    let flag_clone = shutdown_flag.clone();
+    tokio::spawn(async move {
+        shutdown_signal(flag_clone).await;
+    });
 
     loop {
+        if shutdown_flag.load(Ordering::Relaxed) {
+            break;
+        }
         tokio::select! {
             _ = interval.tick() => {
                 for marketplace in &config.scraper.marketplaces {
@@ -153,7 +162,9 @@ async fn cmd_run() -> anyhow::Result<()> {
                     }
                 }
             }
-            _ = &mut shutdown => {
+            // Wake from interval wait immediately on Ctrl+C
+            _ = tokio::signal::ctrl_c() => {
+                info!("SIGINT received. Shutting down.");
                 break;
             }
         }
@@ -170,7 +181,7 @@ async fn cmd_check_now() -> anyhow::Result<()> {
         config.scraper.clone(),
     ))?);
     let state_manager = Arc::new(state::StateManager::new(PathBuf::from("state.json")));
-    let telegram_config = Arc::new(config.telegram.clone());
+    let telegram_configs = Arc::new(config.telegram.clone());
 
     // Connect to Postgres if DATABASE_URL is configured
     let db_pool = match config.database_url() {
@@ -207,7 +218,7 @@ async fn cmd_check_now() -> anyhow::Result<()> {
         scraper,
         state_manager,
         http_client,
-        telegram_config,
+        telegram_configs,
         config.scraper.brand_filter.clone(),
         db_pool,
         shutdown_flag.clone(),
@@ -252,14 +263,16 @@ async fn cmd_dry_run() -> anyhow::Result<()> {
         .map(|s| s.as_str())
         .unwrap_or("test");
     let search_url = amazon_scraper::AmazonScraper::build_search_url(&first_mp.url, first_kw, 1);
-    let notifier = notifier::TelegramNotifier::new(
-        &config.telegram,
-        reqwest::Client::new(),
-        first_kw.to_string(),
-        search_url,
-    )?;
-    notifier.send_test_message().await?;
-    info!("Telegram: OK");
+    for (i, tg) in config.telegram.iter().enumerate() {
+        let notifier = notifier::TelegramNotifier::new(
+            tg,
+            reqwest::Client::new(),
+            first_kw.to_string(),
+            search_url.clone(),
+        )?;
+        notifier.send_test_message().await?;
+        info!("Telegram target {} (chat_id={}): OK", i + 1, tg.chat_id);
+    }
 
     info!("\nAll checks passed. Ready to run: cargo run -p mts-scraper -- run");
 

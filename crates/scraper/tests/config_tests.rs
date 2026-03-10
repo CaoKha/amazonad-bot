@@ -21,7 +21,7 @@ keywords = ["montre connectee", "smartwatch"]
 accept_language = "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7"
 languages = ["fr-FR", "fr", "en-US", "en"]
 
-[telegram]
+[[telegram]]
 chat_id = 123456789
 
 [monitoring]
@@ -44,8 +44,13 @@ fn load_config_from_str(toml: &str) -> anyhow::Result<mts_scraper::config::AppCo
         .context("Failed to deserialize configuration")?;
 
     // Run the same validations as load_config()
-    if app_config.telegram.chat_id == 0 {
-        bail!("telegram.chat_id must be set (got 0).");
+    if app_config.telegram.is_empty() {
+        bail!("telegram must contain at least one target.");
+    }
+    for tg in &app_config.telegram {
+        if tg.chat_id == 0 {
+            bail!("telegram.chat_id must be set (got 0).");
+        }
     }
     if app_config.scraper.marketplaces.is_empty() {
         bail!("scraper.marketplaces must contain at least one marketplace.");
@@ -113,7 +118,7 @@ fn valid_config() {
     assert_eq!(fr.url, "https://www.amazon.fr");
     assert_eq!(fr.code, "FR");
     assert_eq!(config.scraper.brand_filter, "huawei");
-    assert_eq!(config.telegram.chat_id, 123456789);
+    assert_eq!(config.telegram[0].chat_id, 123456789);
     assert_eq!(config.monitoring.interval_minutes, 30);
 }
 
@@ -260,7 +265,7 @@ keywords = ["reloj inteligente"]
 accept_language = "es-ES,es;q=0.9"
 languages = ["es-ES", "es"]
 
-[telegram]
+[[telegram]]
 chat_id = 999888777
 
 [monitoring]

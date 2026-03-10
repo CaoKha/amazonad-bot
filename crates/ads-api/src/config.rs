@@ -6,7 +6,7 @@ pub use mts_common::config::{MonitoringConfig, TelegramConfig};
 #[derive(Debug, Deserialize)]
 pub struct AppConfig {
     pub ads_api: AdsApiConfig,
-    pub telegram: TelegramConfig,
+    pub telegram: Vec<TelegramConfig>,
     pub monitoring: MonitoringConfig,
 }
 
@@ -33,8 +33,13 @@ pub fn load_config() -> Result<AppConfig> {
         "Failed to deserialize configuration. Check config.toml and environment variables.",
     )?;
 
-    if app_config.telegram.chat_id == 0 {
-        bail!("telegram.chat_id must be set (got 0).");
+    if app_config.telegram.is_empty() {
+        bail!("telegram must contain at least one target.");
+    }
+    for tg in &app_config.telegram {
+        if tg.chat_id == 0 {
+            bail!("telegram.chat_id must be set (got 0).");
+        }
     }
     if app_config.ads_api.client_id.is_empty() {
         bail!("ads_api.client_id must not be empty.");
