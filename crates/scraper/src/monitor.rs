@@ -1,8 +1,9 @@
 use anyhow::Result;
 use chrono::Utc;
 use sqlx::PgPool;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::amazon_scraper::AmazonScraper;
@@ -18,7 +19,7 @@ pub struct MonitorEngine {
     telegram_configs: Arc<Vec<TelegramConfig>>,
     brand_filter: String,
     db_pool: Option<PgPool>,
-    shutdown: Arc<AtomicBool>,
+    shutdown: CancellationToken,
 }
 
 impl MonitorEngine {
@@ -29,7 +30,7 @@ impl MonitorEngine {
         telegram_configs: Arc<Vec<TelegramConfig>>,
         brand_filter: String,
         db_pool: Option<PgPool>,
-        shutdown: Arc<AtomicBool>,
+        shutdown: CancellationToken,
     ) -> Self {
         Self {
             scraper,
@@ -51,7 +52,7 @@ impl MonitorEngine {
         let brand_lower = self.brand_filter.to_lowercase();
 
         for keyword in &marketplace.keywords {
-            if self.shutdown.load(Ordering::Relaxed) {
+            if self.shutdown.is_cancelled() {
                 info!("[{}] Shutdown requested, stopping sweep.", marketplace.code);
                 break;
             }
@@ -280,9 +281,13 @@ impl MonitorEngine {
             state.keywords.insert(state_key, new_ks);
         }
 
-        // Close browser AFTER all keywords
-        browser.close().await.ok();
-        handle.await.ok();
+        // Close browser with timeout to prevent hanging on shutdown
+        match tokio::time::timeout(Duration::from_secs(5), browser.close()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!("[{}] Browser close error: {:#}", marketplace.code, e),
+            Err(_) => tracing::warn!("[{}] Browser close timed out after 5s", marketplace.code),
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
 
         // Save state ONCE after the full marketplace sweep
         self.state_manager.save(&state)?;

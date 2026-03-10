@@ -2,12 +2,15 @@ use mts_common::{notifier, state};
 use mts_scraper::{amazon_scraper, bot, config, monitor};
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use tokio_util::sync::CancellationToken;
 use tracing::info;
+
+/// Sentinel file used by `stop` subcommand to signal a running daemon.
+const SENTINEL_FILE: &str = ".mts-stop";
 
 #[derive(Parser)]
 #[command(
@@ -24,6 +27,8 @@ enum Commands {
     Run,
     CheckNow,
     DryRun,
+    /// Signal a running daemon to stop gracefully
+    Stop,
 }
 
 #[tokio::main]
@@ -49,7 +54,16 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Commands::Run => cmd_run().await,
         Commands::CheckNow => cmd_check_now().await,
         Commands::DryRun => cmd_dry_run().await,
+        Commands::Stop => cmd_stop(),
     }
+}
+
+/// Write a sentinel file that the running daemon watches for.
+fn cmd_stop() -> anyhow::Result<()> {
+    let path = PathBuf::from(SENTINEL_FILE);
+    std::fs::write(&path, b"stop")?;
+    println!("Stop signal sent. The running daemon will shut down shortly.");
+    Ok(())
 }
 
 async fn cmd_run() -> anyhow::Result<()> {
@@ -92,7 +106,7 @@ async fn cmd_run() -> anyhow::Result<()> {
         }
     };
 
-    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let cancel_token = CancellationToken::new();
 
     let engine = Arc::new(monitor::MonitorEngine::new(
         scraper.clone(),
@@ -101,7 +115,7 @@ async fn cmd_run() -> anyhow::Result<()> {
         telegram_configs.clone(),
         config.scraper.brand_filter.clone(),
         db_pool,
-        shutdown_flag.clone(),
+        cancel_token.clone(),
     ));
 
     // Bot uses all marketplaces' keywords and URLs for on-demand commands
@@ -125,6 +139,7 @@ async fn cmd_run() -> anyhow::Result<()> {
         state_manager.clone(),
         config.scraper.brand_filter.clone(),
         bot_marketplaces,
+        cancel_token.clone(),
     );
     tokio::spawn(async move { listener.run().await });
 
@@ -141,39 +156,78 @@ async fn cmd_run() -> anyhow::Result<()> {
         config.monitoring.interval_minutes
     );
 
+    // Clean up any stale sentinel file from a previous run
+    let _ = std::fs::remove_file(SENTINEL_FILE);
+
     let mut interval =
         tokio::time::interval(Duration::from_secs(config.monitoring.interval_minutes * 60));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // Spawn signal handler so it runs concurrently — sets shutdown_flag
-    // even while we're deep inside a marketplace sweep.
-    let flag_clone = shutdown_flag.clone();
+    // Spawn signal handler — cancels token on SIGINT/SIGTERM
+    let cancel_for_signal = cancel_token.clone();
     tokio::spawn(async move {
-        shutdown_signal(flag_clone).await;
+        shutdown_signal().await;
+        cancel_for_signal.cancel();
+    });
+
+    // Spawn sentinel file watcher — cancels token when .mts-stop appears
+    let cancel_for_sentinel = cancel_token.clone();
+    tokio::spawn(async move {
+        let sentinel = PathBuf::from(SENTINEL_FILE);
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if sentinel.exists() {
+                info!("Stop sentinel file detected. Initiating shutdown.");
+                std::fs::remove_file(&sentinel).ok();
+                cancel_for_sentinel.cancel();
+                break;
+            }
+        }
+    });
+
+    // Force-exit watchdog: if graceful shutdown takes >30s after cancellation, force kill.
+    // This prevents indefinite hangs from stuck browser sessions or network timeouts.
+    let cancel_for_watchdog = cancel_token.clone();
+    tokio::spawn(async move {
+        cancel_for_watchdog.cancelled().await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        tracing::warn!("Graceful shutdown timed out after 30s. Forcing exit.");
+        std::process::exit(1);
     });
 
     loop {
-        if shutdown_flag.load(Ordering::Relaxed) {
+        if cancel_token.is_cancelled() {
             break;
         }
+
+        // Wait for either the next tick OR cancellation.
+        // This select only covers the WAIT period — not the sweep itself.
         tokio::select! {
-            _ = interval.tick() => {
-                for marketplace in &config.scraper.marketplaces {
-                    if shutdown_flag.load(Ordering::Relaxed) { break; }
-                    match engine.run_check_marketplace(marketplace).await {
-                        Ok(()) => info!("Sweep complete for {}", marketplace.code),
-                        Err(e) => tracing::error!("Sweep failed for {}: {:#}", marketplace.code, e),
-                    }
-                }
-            }
-            // Wake from interval wait immediately on Ctrl+C
-            _ = tokio::signal::ctrl_c() => {
-                info!("SIGINT received. Shutting down.");
+            _ = interval.tick() => {}
+            _ = cancel_token.cancelled() => {
+                info!("Shutdown received while waiting for next sweep.");
                 break;
+            }
+        }
+
+        if cancel_token.is_cancelled() {
+            break;
+        }
+
+        // Run sweep. Cancellation is checked between keywords inside
+        // run_check_marketplace, and between marketplaces here.
+        for marketplace in &config.scraper.marketplaces {
+            if cancel_token.is_cancelled() {
+                break;
+            }
+            match engine.run_check_marketplace(marketplace).await {
+                Ok(()) => info!("Sweep complete for {}", marketplace.code),
+                Err(e) => tracing::error!("Sweep failed for {}: {:#}", marketplace.code, e),
             }
         }
     }
 
+    info!("Shutdown complete.");
     Ok(())
 }
 
@@ -212,10 +266,11 @@ async fn cmd_check_now() -> anyhow::Result<()> {
         None => None,
     };
 
-    let shutdown_flag = Arc::new(AtomicBool::new(false));
-    let flag_clone = shutdown_flag.clone();
+    let cancel_token = CancellationToken::new();
+    let cancel_for_signal = cancel_token.clone();
     tokio::spawn(async move {
-        shutdown_signal(flag_clone).await;
+        shutdown_signal().await;
+        cancel_for_signal.cancel();
     });
 
     let engine = monitor::MonitorEngine::new(
@@ -225,11 +280,11 @@ async fn cmd_check_now() -> anyhow::Result<()> {
         telegram_configs,
         config.scraper.brand_filter.clone(),
         db_pool,
-        shutdown_flag.clone(),
+        cancel_token.clone(),
     );
 
     for marketplace in &config.scraper.marketplaces {
-        if shutdown_flag.load(Ordering::Relaxed) {
+        if cancel_token.is_cancelled() {
             break;
         }
         engine.run_check_marketplace(marketplace).await?;
@@ -283,7 +338,8 @@ async fn cmd_dry_run() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn shutdown_signal(flag: Arc<AtomicBool>) {
+/// Wait for a process termination signal (SIGINT or SIGTERM).
+async fn shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
@@ -303,5 +359,4 @@ async fn shutdown_signal(flag: Arc<AtomicBool>) {
         tokio::signal::ctrl_c().await.ok();
         info!("Shutdown signal received.");
     }
-    flag.store(true, Ordering::SeqCst);
 }

@@ -3,11 +3,10 @@ use mts_common::escape_html;
 use std::sync::Arc;
 
 use serde::Deserialize;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::amazon_scraper::AmazonScraper;
-#[allow(unused_imports)]
-use mts_common::models::{KeywordState, MonitorState, PlacementType};
 use mts_common::state::StateManager;
 
 #[allow(dead_code)]
@@ -49,6 +48,7 @@ pub struct CommandListener {
     state_manager: Arc<StateManager>,
     brand_filter: String,
     marketplaces: Vec<BotMarketplace>,
+    cancel_token: CancellationToken,
 }
 
 impl CommandListener {
@@ -59,6 +59,7 @@ impl CommandListener {
         state_manager: Arc<StateManager>,
         brand_filter: String,
         marketplaces: Vec<BotMarketplace>,
+        cancel_token: CancellationToken,
     ) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -68,6 +69,7 @@ impl CommandListener {
             state_manager,
             brand_filter,
             marketplaces,
+            cancel_token,
         }
     }
 
@@ -81,11 +83,23 @@ impl CommandListener {
                 self.bot_token, offset
             );
 
-            let response = match self.client.get(&url).send().await {
+            // Race the HTTP long-poll against shutdown cancellation
+            let response = tokio::select! {
+                _ = self.cancel_token.cancelled() => {
+                    info!("Bot listener shutting down.");
+                    return;
+                }
+                result = self.client.get(&url).send() => result,
+            };
+
+            let response = match response {
                 Ok(resp) => resp,
                 Err(e) => {
                     warn!("getUpdates request failed: {e}. Retrying in 5s...");
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    tokio::select! {
+                        _ = self.cancel_token.cancelled() => return,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {},
+                    }
                     continue;
                 }
             };
@@ -94,7 +108,10 @@ impl CommandListener {
                 Ok(body) => body,
                 Err(e) => {
                     warn!("Failed to parse getUpdates response: {e}. Retrying in 5s...");
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    tokio::select! {
+                        _ = self.cancel_token.cancelled() => return,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {},
+                    }
                     continue;
                 }
             };

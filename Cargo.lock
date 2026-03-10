@@ -2647,6 +2647,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "tokio-test",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]

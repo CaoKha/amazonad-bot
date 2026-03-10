@@ -4,3 +4,4 @@ state.json
 config.toml
 .sisyphus/
 dist/
+.DS_Store
