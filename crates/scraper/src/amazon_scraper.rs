@@ -19,9 +19,15 @@ impl AmazonScraper {
         Ok(Self { config })
     }
 
-    /// Returns the page-1 search URL (e.g. `https://www.amazon.fr/s?k=montre+connectee`).
+    /// Returns the page-1 search URL using the first configured marketplace.
     pub fn search_url(&self, keyword: &str) -> String {
-        Self::build_search_url(&self.config.marketplace_url, keyword, 1)
+        let base = self
+            .config
+            .marketplaces
+            .first()
+            .map(|m| m.url.as_str())
+            .unwrap_or("https://www.amazon.fr");
+        Self::build_search_url(base, keyword, 1)
     }
 
     fn find_chrome(config: &ScraperConfig) -> Result<std::path::PathBuf> {
@@ -56,8 +62,23 @@ impl AmazonScraper {
     }
 
     pub async fn scrape_search_page(&self, keyword: &str) -> Result<ScrapeResult> {
+        // Default to FR locale for backward compatibility (bot.rs on-demand scrapes)
+        let default_languages = vec![
+            "fr-FR".to_string(),
+            "fr".to_string(),
+            "en-US".to_string(),
+            "en".to_string(),
+        ];
         let (mut browser, handle) = self.launch_browser().await?;
-        let result = self.scrape_all_pages_with_browser(&browser, keyword).await;
+        let result = self
+            .scrape_all_pages_with_browser(
+                &browser,
+                keyword,
+                "https://www.amazon.fr",
+                "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+                &default_languages,
+            )
+            .await;
         browser.close().await.ok();
         handle.await.ok();
         result
@@ -66,7 +87,9 @@ impl AmazonScraper {
     /// Launch a Chrome browser for reuse across multiple scrape calls.
     /// Returns the browser and a background handler task join handle.
     /// Caller is responsible for calling `browser.close().await` and awaiting the handle.
-    pub async fn launch_browser(&self) -> Result<(chromiumoxide::Browser, tokio::task::JoinHandle<()>)> {
+    pub async fn launch_browser(
+        &self,
+    ) -> Result<(chromiumoxide::Browser, tokio::task::JoinHandle<()>)> {
         use chromiumoxide::browser::{Browser, BrowserConfig};
         use futures::StreamExt;
 
@@ -89,14 +112,19 @@ impl AmazonScraper {
         .map_err(|_| anyhow::anyhow!("Browser launch timed out"))?
         .context("Failed to launch Chrome")?;
 
-        let handle = tokio::spawn(async move {
-            while handler.next().await.is_some() {}
-        });
+        let handle = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
         Ok((browser, handle))
     }
 
-    pub async fn scrape_all_pages_with_browser(&self, browser: &chromiumoxide::Browser, keyword: &str) -> Result<ScrapeResult> {
+    pub async fn scrape_all_pages_with_browser(
+        &self,
+        browser: &chromiumoxide::Browser,
+        keyword: &str,
+        marketplace_url: &str,
+        accept_language: &str,
+        languages: &[String],
+    ) -> Result<ScrapeResult> {
         const MODERN_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
             AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
@@ -106,11 +134,7 @@ impl AmazonScraper {
         let mut huawei_sponsored_positions: Vec<usize> = Vec::new();
 
         for page_num in 1..=self.config.pages {
-            let url = Self::build_search_url(
-                &self.config.marketplace_url,
-                keyword,
-                page_num,
-            );
+            let url = Self::build_search_url(marketplace_url, keyword, page_num);
             debug!("Scraping page {}/{}: {}", page_num, self.config.pages, url);
 
             // Create blank page first — stealth scripts registered via
@@ -143,17 +167,13 @@ impl AmazonScraper {
             if let Err(e) = page.enable_stealth_mode_with_agent(MODERN_UA).await {
                 warn!("Stealth mode failed on page {}: {}", page_num, e);
             }
-            if let Err(e) = inject_extra_stealth(&page, MODERN_UA).await {
+            if let Err(e) = inject_extra_stealth(&page, MODERN_UA, accept_language, languages).await
+            {
                 warn!("Extra stealth injection failed on page {}: {}", page_num, e);
             }
 
             // NOW navigate to the actual Amazon URL
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(45),
-                page.goto(&url),
-            )
-            .await
-            {
+            match tokio::time::timeout(std::time::Duration::from_secs(45), page.goto(&url)).await {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => {
                     drop(page);
@@ -177,9 +197,8 @@ impl AmazonScraper {
             let js_check =
                 r#"document.querySelector('div[data-component-type="s-search-result"]') !== null"#;
 
-            let results_appeared = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                async {
+            let results_appeared =
+                tokio::time::timeout(std::time::Duration::from_secs(30), async {
                     loop {
                         let found = page
                             .evaluate(js_check)
@@ -191,10 +210,9 @@ impl AmazonScraper {
                         }
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     }
-                },
-            )
-            .await
-            .unwrap_or(false);
+                })
+                .await
+                .unwrap_or(false);
 
             // Give Amazon's ad-decoration JS time to apply AdHolder classes
             // and sponsored markers to the DOM after results render.
@@ -202,24 +220,24 @@ impl AmazonScraper {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
             if !results_appeared {
-                let url_after = page
-                    .url()
-                    .await
-                    .unwrap_or_default()
-                    .unwrap_or_default();
-                let on_amazon = url_after.contains("amazon.fr");
+                let url_after = page.url().await.unwrap_or_default().unwrap_or_default();
+                let amazon_host = marketplace_url
+                    .trim_end_matches('/')
+                    .split('/')
+                    .next_back()
+                    .unwrap_or("amazon.fr");
+                let on_amazon = url_after.contains(amazon_host);
                 drop(page);
 
                 if page_num == 1 {
                     if !on_amazon {
                         bail!(
-                            "WAF redirected away from amazon.fr to: {}",
+                            "WAF redirected away from {} to: {}",
+                            marketplace_url,
                             url_after
                         );
                     }
-                    bail!(
-                        "No search results appeared within 30s — possible WAF block or CAPTCHA"
-                    );
+                    bail!("No search results appeared within 30s — possible WAF block or CAPTCHA");
                 } else {
                     warn!("Page {} had no results within 30s, stopping", page_num);
                     break;
@@ -297,35 +315,49 @@ impl AmazonScraper {
         Self::parse_results_with_offset(html, brand_filter, 0, 1)
     }
 
-    pub fn parse_results_with_offset(html: &str, brand_filter: &str, offset: usize, page: u32) -> ScrapeResult {
+    pub fn parse_results_with_offset(
+        html: &str,
+        brand_filter: &str,
+        offset: usize,
+        page: u32,
+    ) -> ScrapeResult {
         use std::sync::LazyLock;
 
-        static RESULT_SEL: LazyLock<Selector> = LazyLock::new(||
-            Selector::parse(r#"div[data-component-type="s-search-result"]"#).unwrap());
-        static SPONSORED_SEL: LazyLock<Selector> = LazyLock::new(||
-            Selector::parse(r#"div[data-component-type="sp-sponsored-result"]"#).unwrap());
-        static ADHOLDER_SEL: LazyLock<Selector> = LazyLock::new(||
-            Selector::parse(".AdHolder").unwrap());
-        static H2_SEL: LazyLock<Selector> = LazyLock::new(||
-            Selector::parse("h2").unwrap());
-        static SPONSORED_LABEL_SEL: LazyLock<Selector> = LazyLock::new(||
-            Selector::parse(".puis-sponsored-label-text").unwrap());
-        static FEEDBACK_SEL: LazyLock<Selector> = LazyLock::new(||
-            Selector::parse(r#"span[data-action="multi-ad-feedback-form-trigger"]"#).unwrap());
+        static RESULT_SEL: LazyLock<Selector> = LazyLock::new(|| {
+            Selector::parse(r#"div[data-component-type="s-search-result"]"#).unwrap()
+        });
+        static SPONSORED_SEL: LazyLock<Selector> = LazyLock::new(|| {
+            Selector::parse(r#"div[data-component-type="sp-sponsored-result"]"#).unwrap()
+        });
+        static ADHOLDER_SEL: LazyLock<Selector> =
+            LazyLock::new(|| Selector::parse(".AdHolder").unwrap());
+        static H2_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("h2").unwrap());
+        static SPONSORED_LABEL_SEL: LazyLock<Selector> =
+            LazyLock::new(|| Selector::parse(".puis-sponsored-label-text").unwrap());
+        static FEEDBACK_SEL: LazyLock<Selector> = LazyLock::new(|| {
+            Selector::parse(r#"span[data-action="multi-ad-feedback-form-trigger"]"#).unwrap()
+        });
         // Sponsored Brands: headline banner / video ads
-        static SB_BRAND_LABEL_SEL: LazyLock<Selector> = LazyLock::new(||
-            Selector::parse(".sponsored-brand-label-info-desktop").unwrap());
-        static SB_VIDEO_SEL: LazyLock<Selector> = LazyLock::new(||
-            Selector::parse(r#"div[data-component-type="sbv-video"], [data-component-type="sbv-video-single-product"]"#).unwrap());
-        static TOP_SLOT_SEL: LazyLock<Selector> = LazyLock::new(||
-            Selector::parse(r#"span[data-component-type="s-top-slot"]"#).unwrap());
+        static SB_BRAND_LABEL_SEL: LazyLock<Selector> =
+            LazyLock::new(|| Selector::parse(".sponsored-brand-label-info-desktop").unwrap());
+        static SB_VIDEO_SEL: LazyLock<Selector> = LazyLock::new(|| {
+            Selector::parse(r#"div[data-component-type="sbv-video"], [data-component-type="sbv-video-single-product"]"#).unwrap()
+        });
+        static TOP_SLOT_SEL: LazyLock<Selector> =
+            LazyLock::new(|| Selector::parse(r#"span[data-component-type="s-top-slot"]"#).unwrap());
         // Enrichment selectors
-        static PRICE_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse(".a-price .a-offscreen").unwrap());
-        static RATING_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("span.a-icon-alt").unwrap());
-        static REVIEW_COUNT_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("span.s-underline-text").unwrap());
-        static PRIME_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("i.a-icon-prime").unwrap());
-        static BADGE_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("span.a-badge-text").unwrap());
-        static BRAND_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("span.a-size-base.a-color-secondary").unwrap());
+        static PRICE_SEL: LazyLock<Selector> =
+            LazyLock::new(|| Selector::parse(".a-price .a-offscreen").unwrap());
+        static RATING_SEL: LazyLock<Selector> =
+            LazyLock::new(|| Selector::parse("span.a-icon-alt").unwrap());
+        static REVIEW_COUNT_SEL: LazyLock<Selector> =
+            LazyLock::new(|| Selector::parse("span.s-underline-text").unwrap());
+        static PRIME_SEL: LazyLock<Selector> =
+            LazyLock::new(|| Selector::parse("i.a-icon-prime").unwrap());
+        static BADGE_SEL: LazyLock<Selector> =
+            LazyLock::new(|| Selector::parse("span.a-badge-text").unwrap());
+        static BRAND_SEL: LazyLock<Selector> =
+            LazyLock::new(|| Selector::parse("span.a-size-base.a-color-secondary").unwrap());
         static LINK_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("a[href]").unwrap());
 
         let document = Html::parse_document(html);
@@ -384,7 +416,9 @@ impl AmazonScraper {
                 })
                 .unwrap_or_default();
 
-            let has_sponsored_text = element.text().any(|t| t.contains("Sponsorisé") || t.contains("Sponsored"));
+            let has_sponsored_text = element
+                .text()
+                .any(|t| t.contains("Sponsorisé") || t.contains("Sponsored"));
             let has_sponsored_class = element.select(&SPONSORED_LABEL_SEL).next().is_some();
             let is_sponsored = sponsored_asins.contains(&asin)
                 || adholder_asins.contains(&asin)
@@ -392,42 +426,44 @@ impl AmazonScraper {
                 || has_sponsored_class;
 
             // === Enrichment fields ===
-            let price = element.select(&PRICE_SEL).next()
+            let price = element
+                .select(&PRICE_SEL)
+                .next()
                 .map(|el| el.text().collect::<String>().trim().to_string())
                 .filter(|s| !s.is_empty());
 
-            let rating = element.select(&RATING_SEL).next()
-                .and_then(|el| {
-                    let text = el.text().collect::<String>();
-                    // French format: "4,5 sur 5 étoiles"
-                    text.split_whitespace().next()
-                        .and_then(|s| s.replace(',', ".").parse::<f32>().ok())
-                });
+            let rating = element.select(&RATING_SEL).next().and_then(|el| {
+                let text = el.text().collect::<String>();
+                // French format: "4,5 sur 5 étoiles"
+                text.split_whitespace()
+                    .next()
+                    .and_then(|s| s.replace(',', ".").parse::<f32>().ok())
+            });
 
-            let review_count = element.select(&REVIEW_COUNT_SEL).next()
-                .and_then(|el| {
-                    let text = el.text().collect::<String>();
-                    let digits: String = text.chars().filter(|c| c.is_ascii_digit()).collect();
-                    digits.parse::<u32>().ok()
-                });
+            let review_count = element.select(&REVIEW_COUNT_SEL).next().and_then(|el| {
+                let text = el.text().collect::<String>();
+                let digits: String = text.chars().filter(|c| c.is_ascii_digit()).collect();
+                digits.parse::<u32>().ok()
+            });
 
             let is_prime = element.select(&PRIME_SEL).next().is_some();
 
-            let badge = element.select(&BADGE_SEL).next()
-                .and_then(|el| {
-                    let text = el.text().collect::<String>();
-                    if text.contains("Meilleur vendeur") || text.contains("Best Seller") {
-                        Some(BadgeType::BestSeller)
-                    } else if text.contains("Choix d'Amazon") || text.contains("Amazon's Choice") {
-                        Some(BadgeType::AmazonChoice)
-                    } else if text.contains("Très bien noté") || text.contains("Highly rated") {
-                        Some(BadgeType::HighlyRated)
-                    } else {
-                        None
-                    }
-                });
+            let badge = element.select(&BADGE_SEL).next().and_then(|el| {
+                let text = el.text().collect::<String>();
+                if text.contains("Meilleur vendeur") || text.contains("Best Seller") {
+                    Some(BadgeType::BestSeller)
+                } else if text.contains("Choix d'Amazon") || text.contains("Amazon's Choice") {
+                    Some(BadgeType::AmazonChoice)
+                } else if text.contains("Très bien noté") || text.contains("Highly rated") {
+                    Some(BadgeType::HighlyRated)
+                } else {
+                    None
+                }
+            });
 
-            let brand = element.select(&BRAND_SEL).next()
+            let brand = element
+                .select(&BRAND_SEL)
+                .next()
                 .map(|el| el.text().collect::<String>().trim().to_string())
                 .filter(|s| !s.is_empty());
 
@@ -435,7 +471,7 @@ impl AmazonScraper {
                 info!(
                     "result page={} pos={} asin={} title={:?} brand={:?} sp={} adholder={} text_sp={} class_sp={} => is_sponsored={}",
                     page, pos_in_page, asin,
-                    &title[..title.len().min(60)],
+                    &title[..title.char_indices().nth(60).map(|(i, _)| i).unwrap_or(title.len())],
                     brand.as_deref().unwrap_or("-"),
                     sponsored_asins.contains(&asin),
                     adholder_asins.contains(&asin),
@@ -452,7 +488,11 @@ impl AmazonScraper {
                 page,
                 position_in_page: pos_in_page,
                 is_sponsored,
-                placement_type: if is_sponsored { Some(PlacementType::SponsoredProduct) } else { None },
+                placement_type: if is_sponsored {
+                    Some(PlacementType::SponsoredProduct)
+                } else {
+                    None
+                },
                 price,
                 rating,
                 review_count,
@@ -472,12 +512,20 @@ impl AmazonScraper {
             };
             let outer = match serde_json::from_str::<serde_json::Value>(attr) {
                 Ok(v) => v,
-                Err(e) => { debug!("widget: outer JSON parse failed: {e}"); continue; }
+                Err(e) => {
+                    debug!("widget: outer JSON parse failed: {e}");
+                    continue;
+                }
             };
-            let Some(inner_str) = outer["multiAdfPayload"].as_str() else { continue; };
+            let Some(inner_str) = outer["multiAdfPayload"].as_str() else {
+                continue;
+            };
             let inner = match serde_json::from_str::<serde_json::Value>(inner_str) {
                 Ok(v) => v,
-                Err(e) => { debug!("widget: inner JSON parse failed: {e}"); continue; }
+                Err(e) => {
+                    debug!("widget: inner JSON parse failed: {e}");
+                    continue;
+                }
             };
             let Some(ads) = inner["adCreativeMetaData"]["adCreativeDetails"].as_array() else {
                 continue;
@@ -485,25 +533,29 @@ impl AmazonScraper {
             debug!(
                 "widget: {} ads in slot={}",
                 ads.len(),
-                inner["adPlacementMetaData"]["slotName"].as_str().unwrap_or("?"),
+                inner["adPlacementMetaData"]["slotName"]
+                    .as_str()
+                    .unwrap_or("?"),
             );
-        for ad in ads {
-            let asin = ad["asin"].as_str().unwrap_or("");
-            let title = ad["title"].as_str().unwrap_or("").trim().to_string();
-            if asin.is_empty() || already_seen.contains(asin) { continue; }
-            debug!("widget: added asin={}", asin);
-            results.push(SearchResult {
-                asin: asin.to_string(),
-                title,
-                position: 0,
-                page,
-                position_in_page: 0,
-                is_sponsored: true,
-                placement_type: Some(PlacementType::SponsoredProductCarousel),
-                ..Default::default()
-            });
-            widget_added += 1;
-        }
+            for ad in ads {
+                let asin = ad["asin"].as_str().unwrap_or("");
+                let title = ad["title"].as_str().unwrap_or("").trim().to_string();
+                if asin.is_empty() || already_seen.contains(asin) {
+                    continue;
+                }
+                debug!("widget: added asin={}", asin);
+                results.push(SearchResult {
+                    asin: asin.to_string(),
+                    title,
+                    position: 0,
+                    page,
+                    position_in_page: 0,
+                    is_sponsored: true,
+                    placement_type: Some(PlacementType::SponsoredProductCarousel),
+                    ..Default::default()
+                });
+                widget_added += 1;
+            }
         }
         debug!("parse page={} widget_carousel_added={}", page, widget_added);
 
@@ -514,13 +566,17 @@ impl AmazonScraper {
         // Method 1: Look for sponsored-brand-label-info-desktop in top slots
         for top_slot in document.select(&TOP_SLOT_SEL) {
             let has_brand_label = top_slot.select(&SB_BRAND_LABEL_SEL).next().is_some();
-            if !has_brand_label { continue; }
+            if !has_brand_label {
+                continue;
+            }
             // Extract ASINs from links within the brand banner
             for link in top_slot.select(&H2_SEL) {
                 // Find parent search result div with data-asin
                 // Sponsored Brands often have product cards with ASINs
                 let title_text = link.text().collect::<String>().trim().to_string();
-                if title_text.is_empty() { continue; }
+                if title_text.is_empty() {
+                    continue;
+                }
                 // Try to find ASIN from nearby elements
                 if let Some(parent) = link.parent_element() {
                     if let Some(asin) = find_asin_in_ancestors(&parent) {
@@ -545,10 +601,14 @@ impl AmazonScraper {
         // Method 2: Look for sbv-video containers (Sponsored Brands Video)
         for video_el in document.select(&SB_VIDEO_SEL) {
             // SB Video containers typically have product info and ASIN
-            let direct_asin = video_el.value().attr("data-asin")
+            let direct_asin = video_el
+                .value()
+                .attr("data-asin")
                 .or_else(|| video_el.value().attr("data-csa-c-asin"))
-                .unwrap_or("").to_string();
-            let title = video_el.select(&H2_SEL)
+                .unwrap_or("")
+                .to_string();
+            let title = video_el
+                .select(&H2_SEL)
                 .next()
                 .map(|h| h.text().collect::<String>().trim().to_string())
                 .unwrap_or_default();
@@ -588,7 +648,9 @@ impl AmazonScraper {
                     } else {
                         link.text().collect::<String>().trim().to_string()
                     };
-                    if link_title.is_empty() { continue; }
+                    if link_title.is_empty() {
+                        continue;
+                    }
                     results.push(SearchResult {
                         asin: dp_asin,
                         title: link_title,
@@ -620,8 +682,11 @@ impl AmazonScraper {
                 || full_text.contains("Recommandation éditoriale")
                 || full_text.contains("Recommandations éditoriales")
                 || full_text.contains("editorial recommendation");
-            if !is_editorial { continue; }
-            let title = el.select(&H2_SEL)
+            if !is_editorial {
+                continue;
+            }
+            let title = el
+                .select(&H2_SEL)
                 .next()
                 .map(|h| h.text().collect::<String>().trim().to_string())
                 .unwrap_or_default();
@@ -644,7 +709,9 @@ impl AmazonScraper {
             .filter(|r| {
                 r.is_sponsored
                     && (r.title.to_lowercase().contains(&brand_lower)
-                        || r.brand.as_ref().map_or(false, |b| b.to_lowercase().contains(&brand_lower)))
+                        || r.brand
+                            .as_ref()
+                            .is_some_and(|b| b.to_lowercase().contains(&brand_lower)))
             })
             .collect();
 
@@ -652,12 +719,16 @@ impl AmazonScraper {
         let sponsored_count = results.iter().filter(|r| r.is_sponsored).count();
         info!(
             "parse page={} total_results={} sponsored={} brand_match={}",
-            page, results.len(), sponsored_count, huawei_sponsored.len()
+            page,
+            results.len(),
+            sponsored_count,
+            huawei_sponsored.len()
         );
         for r in &huawei_sponsored {
             info!(
                 "  brand_match: asin={} title={:?} brand={:?} placement={:?}",
-                r.asin, &r.title[..r.title.len().min(60)],
+                r.asin,
+                &r.title[..r.title.len().min(60)],
                 r.brand.as_deref().unwrap_or("-"),
                 r.placement_type
             );
@@ -686,7 +757,12 @@ impl AmazonScraper {
         if page <= 1 {
             format!("{}/s?k={}", base.trim_end_matches('/'), encoded)
         } else {
-            format!("{}/s?k={}&page={}", base.trim_end_matches('/'), encoded, page)
+            format!(
+                "{}/s?k={}&page={}",
+                base.trim_end_matches('/'),
+                encoded,
+                page
+            )
         }
     }
 }
@@ -695,7 +771,9 @@ impl AmazonScraper {
 fn find_asin_in_ancestors(el: &scraper::ElementRef) -> Option<String> {
     // Check the element itself
     if let Some(asin) = el.value().attr("data-asin") {
-        if !asin.is_empty() { return Some(asin.to_string()); }
+        if !asin.is_empty() {
+            return Some(asin.to_string());
+        }
     }
     // Walk up parents (limited to 5 levels to avoid excessive traversal)
     let mut node = el.parent();
@@ -704,7 +782,9 @@ fn find_asin_in_ancestors(el: &scraper::ElementRef) -> Option<String> {
             Some(n) => {
                 if let Some(element) = n.value().as_element() {
                     if let Some(asin) = element.attr("data-asin") {
-                        if !asin.is_empty() { return Some(asin.to_string()); }
+                        if !asin.is_empty() {
+                            return Some(asin.to_string());
+                        }
                     }
                 }
                 node = n.parent();
@@ -715,16 +795,16 @@ fn find_asin_in_ancestors(el: &scraper::ElementRef) -> Option<String> {
     None
 }
 
-
 /// Extract ASIN from an Amazon `/dp/ASIN` link.
 fn extract_asin_from_dp_link(href: &str) -> Option<String> {
     let idx = href.find("/dp/")?;
     let after = &href[idx + 4..];
     let asin = after.split(['/', '?', '#', '&']).next()?;
-    if asin.is_empty() { return None; }
+    if asin.is_empty() {
+        return None;
+    }
     Some(asin.to_string())
 }
-
 
 /// Inject additional stealth patches beyond chromiumoxide's built-in stealth mode.
 ///
@@ -742,22 +822,34 @@ fn extract_asin_from_dp_link(href: &str) -> Option<String> {
 ///   - navigator.deviceMemory
 ///   - Screen dimension consistency
 ///   - iframe contentWindow.navigator.webdriver leak
-async fn inject_extra_stealth(page: &chromiumoxide::Page, ua: &str) -> Result<()> {
-    use chromiumoxide_cdp::cdp::browser_protocol::
-        page::AddScriptToEvaluateOnNewDocumentParams;
-    use chromiumoxide_cdp::cdp::browser_protocol::
-        network::SetUserAgentOverrideParams;
+async fn inject_extra_stealth(
+    page: &chromiumoxide::Page,
+    ua: &str,
+    accept_language: &str,
+    languages: &[String],
+) -> Result<()> {
+    use chromiumoxide_cdp::cdp::browser_protocol::network::SetUserAgentOverrideParams;
+    use chromiumoxide_cdp::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams;
 
-    // Override User-Agent with Accept-Language header for French Amazon.
+    // Override User-Agent with Accept-Language header for the target marketplace.
     // Without this, Chrome sends no Accept-Language which is a bot signal.
     let mut ua_params = SetUserAgentOverrideParams::new(ua.to_string());
-    ua_params.accept_language = Some("fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7".to_string());
+    ua_params.accept_language = Some(accept_language.to_string());
     ua_params.platform = Some("macOS".to_string());
     page.execute(ua_params).await?;
 
+    // Build navigator.languages JS dynamically from the locale slice.
+    let langs_js = languages
+        .iter()
+        .map(|l| format!("'{}'", l))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let stealth_js = build_stealth_js(&langs_js);
+
     // Inject supplementary stealth JavaScript that runs before any page scripts.
     page.execute(AddScriptToEvaluateOnNewDocumentParams {
-        source: EXTRA_STEALTH_JS.to_string(),
+        source: stealth_js,
         world_name: None,
         include_command_line_api: None,
         run_immediately: None,
@@ -767,75 +859,79 @@ async fn inject_extra_stealth(page: &chromiumoxide::Page, ua: &str) -> Result<()
     Ok(())
 }
 
-/// Stealth JavaScript patches injected via Page.addScriptToEvaluateOnNewDocument.
-/// Runs before ANY page scripts on every navigation.
-const EXTRA_STEALTH_JS: &str = r#"
+/// Build the stealth JavaScript with dynamic navigator.languages.
+fn build_stealth_js(langs_js: &str) -> String {
+    format!(
+        r#"
     // navigator.languages — Amazon checks this is non-empty and locale-consistent.
     // Headless Chrome returns an empty array by default.
-    Object.defineProperty(Object.getPrototypeOf(navigator), 'languages', {
-        get: () => Object.freeze(['fr-FR', 'fr', 'en-US', 'en'])
-    });
+    Object.defineProperty(Object.getPrototypeOf(navigator), 'languages', {{
+        get: () => Object.freeze([{langs_js}])
+    }});
 
     // navigator.hardwareConcurrency — headless often reports 1-2 cores which is suspicious.
-    Object.defineProperty(Object.getPrototypeOf(navigator), 'hardwareConcurrency', {
+    Object.defineProperty(Object.getPrototypeOf(navigator), 'hardwareConcurrency', {{
         get: () => 8
-    });
+    }});
 
     // navigator.deviceMemory — should match a plausible real device.
-    if ('deviceMemory' in navigator) {
-        Object.defineProperty(Object.getPrototypeOf(navigator), 'deviceMemory', {
+    if ('deviceMemory' in navigator) {{
+        Object.defineProperty(Object.getPrototypeOf(navigator), 'deviceMemory', {{
             get: () => 8
-        });
-    }
+        }});
+    }}
 
     // navigator.maxTouchPoints — desktop browsers report 0.
-    Object.defineProperty(Object.getPrototypeOf(navigator), 'maxTouchPoints', {
+    Object.defineProperty(Object.getPrototypeOf(navigator), 'maxTouchPoints', {{
         get: () => 0
-    });
+    }});
 
     // Notification.permission — headless defaults to 'denied', real browsers to 'default'.
-    if (typeof Notification !== 'undefined') {
-        Object.defineProperty(Notification, 'permission', {
+    if (typeof Notification !== 'undefined') {{
+        Object.defineProperty(Notification, 'permission', {{
             get: () => 'default',
             configurable: true
-        });
-    }
+        }});
+    }}
 
     // navigator.connection — fake Network Information API.
     // Missing entirely in headless is a detection signal.
-    if (!('connection' in navigator)) {
-        Object.defineProperty(Object.getPrototypeOf(navigator), 'connection', {
-            get: () => ({
+    if (!('connection' in navigator)) {{
+        Object.defineProperty(Object.getPrototypeOf(navigator), 'connection', {{
+            get: () => ({{
                 effectiveType: '4g',
                 rtt: 50,
                 downlink: 10,
                 saveData: false
-            })
-        });
-    }
+            }})
+        }});
+    }}
 
     // Screen dimensions — headless often has outerWidth/outerHeight = 0.
-    if (window.outerWidth === 0) {
-        Object.defineProperty(window, 'outerWidth', { get: () => window.innerWidth });
-        Object.defineProperty(window, 'outerHeight', { get: () => window.innerHeight + 85 });
-    }
+    if (window.outerWidth === 0) {{
+        Object.defineProperty(window, 'outerWidth', {{ get: () => window.innerWidth }});
+        Object.defineProperty(window, 'outerHeight', {{ get: () => window.innerHeight + 85 }});
+    }}
 
     // iframe contentWindow.navigator.webdriver leak prevention.
     // Even with navigator.webdriver patched, iframes may leak the real value.
     const origCW = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentWindow');
-    if (origCW && origCW.get) {
-        Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
-            get: function() {
+    if (origCW && origCW.get) {{
+        Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {{
+            get: function() {{
                 const win = origCW.get.call(this);
-                if (win) {
-                    try {
-                        Object.defineProperty(win.navigator, 'webdriver', {
+                if (win) {{
+                    try {{
+                        Object.defineProperty(win.navigator, 'webdriver', {{
                             get: () => false
-                        });
-                    } catch(e) {}
-                }
+                        }});
+                    }} catch(e) {{}}
+                }}
                 return win;
-            }
-        });
-    }
-"#;
+            }}
+        }});
+    }}
+"#,
+        langs_js = langs_js
+    )
+}

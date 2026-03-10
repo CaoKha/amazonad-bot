@@ -543,7 +543,11 @@ const HTML_WITH_BEST_SELLER_BADGE: &str = r#"
 #[test]
 fn price_parsed_from_offscreen_span() {
     let result = AmazonScraper::parse_results(HTML_WITH_PRICE, "huawei");
-    let huawei = result.results.iter().find(|r| r.asin == "B0HUAWEI01").unwrap();
+    let huawei = result
+        .results
+        .iter()
+        .find(|r| r.asin == "B0HUAWEI01")
+        .unwrap();
     assert_eq!(
         huawei.price.as_deref(),
         Some("149,99 €"),
@@ -554,7 +558,11 @@ fn price_parsed_from_offscreen_span() {
 #[test]
 fn rating_parsed_from_icon_alt() {
     let result = AmazonScraper::parse_results(HTML_WITH_RATING, "huawei");
-    let huawei = result.results.iter().find(|r| r.asin == "B0HUAWEI01").unwrap();
+    let huawei = result
+        .results
+        .iter()
+        .find(|r| r.asin == "B0HUAWEI01")
+        .unwrap();
     assert!(
         huawei.rating.is_some(),
         "Rating should be parsed from span.a-icon-alt"
@@ -570,14 +578,17 @@ fn rating_parsed_from_icon_alt() {
 fn best_seller_badge_detected() {
     use mts_common::models::BadgeType;
     let result = AmazonScraper::parse_results(HTML_WITH_BEST_SELLER_BADGE, "huawei");
-    let huawei = result.results.iter().find(|r| r.asin == "B0HUAWEI01").unwrap();
+    let huawei = result
+        .results
+        .iter()
+        .find(|r| r.asin == "B0HUAWEI01")
+        .unwrap();
     assert_eq!(
         huawei.badge,
         Some(BadgeType::BestSeller),
         "BestSeller badge should be detected from span.a-badge-text"
     );
 }
-
 
 const HTML_SBV_VIDEO_SINGLE_PRODUCT: &str = r#"
 <!DOCTYPE html>

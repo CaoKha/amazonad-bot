@@ -9,3 +9,8 @@ pub struct TelegramConfig {
 pub struct MonitoringConfig {
     pub interval_minutes: u64,
 }
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct DatabaseConfig {
+    pub url: String,
+}

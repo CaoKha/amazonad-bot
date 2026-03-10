@@ -1,10 +1,12 @@
 use anyhow::Result;
 use chrono::Utc;
+use sqlx::PgPool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::amazon_scraper::AmazonScraper;
-use crate::config::TelegramConfig;
+use crate::config::{MarketplaceConfig, TelegramConfig};
 use mts_common::models::KeywordState;
 use mts_common::notifier::{SponsoredEntry, TelegramNotifier};
 use mts_common::state::StateManager;
@@ -15,8 +17,8 @@ pub struct MonitorEngine {
     http_client: reqwest::Client,
     telegram_config: Arc<TelegramConfig>,
     brand_filter: String,
-    keywords: Vec<String>,
-    marketplace_url: String,
+    db_pool: Option<PgPool>,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl MonitorEngine {
@@ -26,8 +28,8 @@ impl MonitorEngine {
         http_client: reqwest::Client,
         telegram_config: Arc<TelegramConfig>,
         brand_filter: String,
-        keywords: Vec<String>,
-        marketplace_url: String,
+        db_pool: Option<PgPool>,
+        shutdown: Arc<AtomicBool>,
     ) -> Self {
         Self {
             scraper,
@@ -35,68 +37,120 @@ impl MonitorEngine {
             http_client,
             telegram_config,
             brand_filter,
-            keywords,
-            marketplace_url,
+            db_pool,
+            shutdown,
         }
     }
 
-    pub async fn run_check(&self) -> Result<()> {
-        // Launch ONE browser for the entire sweep
+    /// Run a full sweep for a single marketplace (all its keywords).
+    pub async fn run_check_marketplace(&self, marketplace: &MarketplaceConfig) -> Result<()> {
+        // Launch ONE browser for the entire marketplace sweep
         let (mut browser, handle) = self.scraper.launch_browser().await?;
 
         let mut state = self.state_manager.load()?.unwrap_or_default();
         let brand_lower = self.brand_filter.to_lowercase();
 
-        for keyword in &self.keywords {
-            info!("Scraping keyword: '{}'", keyword);
+        for keyword in &marketplace.keywords {
+            if self.shutdown.load(Ordering::Relaxed) {
+                info!("[{}] Shutdown requested, stopping sweep.", marketplace.code);
+                break;
+            }
+
+            info!("[{}] Scraping keyword: '{}'", marketplace.code, keyword);
 
             let scrape_result = match self
                 .scraper
-                .scrape_all_pages_with_browser(&browser, keyword)
+                .scrape_all_pages_with_browser(
+                    &browser,
+                    keyword,
+                    &marketplace.url,
+                    &marketplace.accept_language,
+                    &marketplace.languages,
+                )
                 .await
             {
                 Ok(r) => r,
                 Err(e) => {
-                    tracing::error!("Scrape failed for keyword '{}': {:#}", keyword, e);
-                    continue; // per-keyword error: log and continue
+                    tracing::error!(
+                        "[{}] Scrape failed for keyword '{}': {:#}",
+                        marketplace.code,
+                        keyword,
+                        e
+                    );
+                    continue;
                 }
             };
 
             if scrape_result.results.is_empty() {
                 warn!(
-                    "Keyword '{}': 0 results — possible block, skipping state update",
-                    keyword
+                    "[{}] Keyword '{}': 0 results — possible block, skipping state update",
+                    marketplace.code, keyword
                 );
                 continue;
             }
 
             info!(
-                "Keyword '{}': scraped {} results",
+                "[{}] Keyword '{}': scraped {} results",
+                marketplace.code,
                 keyword,
                 scrape_result.results.len()
             );
 
+            // Persist to Postgres if pool is available
+            if let Some(ref pool) = self.db_pool {
+                match mts_common::db::insert_scrape_run(
+                    pool,
+                    &marketplace.code,
+                    keyword,
+                    &scrape_result,
+                    &self.brand_filter,
+                )
+                .await
+                {
+                    Ok(run_id) => {
+                        info!(
+                            "[{}] Keyword '{}': saved to DB (run_id={})",
+                            marketplace.code, keyword, run_id
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "[{}] Keyword '{}': DB insert failed: {:#}",
+                            marketplace.code, keyword, e
+                        );
+                    }
+                }
+            }
+
+            // Use marketplace-scoped key for state: "FR:keyword"
+            let state_key = format!("{}:{}", marketplace.code, keyword);
+
             let prev_ks = state
                 .keywords
-                .get(keyword.as_str())
+                .get(state_key.as_str())
                 .cloned()
                 .unwrap_or_default();
 
             // Determine brand visibility
-            let brand_ad_visible = scrape_result
-                .results
-                .iter()
-                .any(|r| {
-                    r.is_sponsored
-                        && (r.title.to_lowercase().contains(&brand_lower)
-                            || r.brand.as_ref().map_or(false, |b| b.to_lowercase().contains(&brand_lower)))
-                });
+            let brand_ad_visible = scrape_result.results.iter().any(|r| {
+                r.is_sponsored
+                    && (r.title.to_lowercase().contains(&brand_lower)
+                        || r.brand
+                            .as_ref()
+                            .is_some_and(|b| b.to_lowercase().contains(&brand_lower)))
+            });
 
             let brand_positions: Vec<(u32, usize, Option<mts_common::models::PlacementType>)> =
                 scrape_result
                     .results
                     .iter()
-                    .filter(|r| r.is_sponsored && (r.title.to_lowercase().contains(&brand_lower) || r.brand.as_ref().map_or(false, |b| b.to_lowercase().contains(&brand_lower))))
+                    .filter(|r| {
+                        r.is_sponsored
+                            && (r.title.to_lowercase().contains(&brand_lower)
+                                || r.brand
+                                    .as_ref()
+                                    .is_some_and(|b| b.to_lowercase().contains(&brand_lower)))
+                    })
                     .map(|r| (r.page, r.position_in_page, r.placement_type.clone()))
                     .collect();
 
@@ -108,7 +162,7 @@ impl MonitorEngine {
             };
 
             // Send Telegram notification if state changed
-            let search_url = AmazonScraper::build_search_url(&self.marketplace_url, keyword, 1);
+            let search_url = AmazonScraper::build_search_url(&marketplace.url, keyword, 1);
             let notifier = match TelegramNotifier::new(
                 &self.telegram_config,
                 self.http_client.clone(),
@@ -118,10 +172,9 @@ impl MonitorEngine {
                 Ok(n) => n,
                 Err(e) => {
                     warn!(
-                        "Failed to create notifier for keyword '{}': {:#}",
-                        keyword, e
+                        "[{}] Failed to create notifier for keyword '{}': {:#}",
+                        marketplace.code, keyword, e
                     );
-                    // Still update state even if notifier fails
                     let new_ks = KeywordState {
                         brand_ad_visible,
                         brand_positions,
@@ -129,17 +182,26 @@ impl MonitorEngine {
                         last_checked: Some(now),
                         last_results: scrape_result.results,
                     };
-                    state.keywords.insert(keyword.clone(), new_ks);
+                    state.keywords.insert(state_key, new_ks);
                     continue;
                 }
             };
 
             if !prev_ks.brand_ad_visible && brand_ad_visible {
-                info!("Keyword '{}': brand ad APPEARED", keyword);
+                info!(
+                    "[{}] Keyword '{}': brand ad APPEARED",
+                    marketplace.code, keyword
+                );
                 let sample_title = scrape_result
                     .results
                     .iter()
-                    .find(|r| r.is_sponsored && (r.title.to_lowercase().contains(&brand_lower) || r.brand.as_ref().map_or(false, |b| b.to_lowercase().contains(&brand_lower))))
+                    .find(|r| {
+                        r.is_sponsored
+                            && (r.title.to_lowercase().contains(&brand_lower)
+                                || r.brand
+                                    .as_ref()
+                                    .is_some_and(|b| b.to_lowercase().contains(&brand_lower)))
+                    })
                     .map(|r| r.title.clone())
                     .unwrap_or_default();
 
@@ -167,22 +229,25 @@ impl MonitorEngine {
                     .await
                 {
                     warn!(
-                        "Failed to send ad appeared notification for '{}': {:#}",
-                        keyword, e
+                        "[{}] Failed to send ad appeared notification for '{}': {:#}",
+                        marketplace.code, keyword, e
                     );
                 }
             } else if prev_ks.brand_ad_visible && !brand_ad_visible {
-                info!("Keyword '{}': brand ad DISAPPEARED", keyword);
+                info!(
+                    "[{}] Keyword '{}': brand ad DISAPPEARED",
+                    marketplace.code, keyword
+                );
                 if let Err(e) = notifier.send_ad_disappeared().await {
                     warn!(
-                        "Failed to send ad disappeared notification for '{}': {:#}",
-                        keyword, e
+                        "[{}] Failed to send ad disappeared notification for '{}': {:#}",
+                        marketplace.code, keyword, e
                     );
                 }
             } else {
                 info!(
-                    "Keyword '{}': no change (brand_visible={})",
-                    keyword, brand_ad_visible
+                    "[{}] Keyword '{}': no change (brand_visible={})",
+                    marketplace.code, keyword, brand_ad_visible
                 );
             }
 
@@ -194,16 +259,16 @@ impl MonitorEngine {
                 last_checked: Some(now),
                 last_results: scrape_result.results,
             };
-            state.keywords.insert(keyword.clone(), new_ks);
+            state.keywords.insert(state_key, new_ks);
         }
 
         // Close browser AFTER all keywords
         browser.close().await.ok();
         handle.await.ok();
 
-        // Save state ONCE after the full sweep
+        // Save state ONCE after the full marketplace sweep
         self.state_manager.save(&state)?;
-        info!("Sweep complete. State saved.");
+        info!("[{}] Sweep complete. State saved.", marketplace.code);
 
         Ok(())
     }

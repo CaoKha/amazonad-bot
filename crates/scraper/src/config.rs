@@ -2,25 +2,47 @@ use anyhow::{bail, Context, Result};
 use serde::de::{self, Deserializer, SeqAccess, Visitor};
 use serde::Deserialize;
 
-pub use mts_common::config::{MonitoringConfig, TelegramConfig};
+pub use mts_common::config::{DatabaseConfig, MonitoringConfig, TelegramConfig};
 
 #[derive(Debug, Deserialize)]
 pub struct AppConfig {
+    #[serde(default)]
+    pub database: Option<DatabaseConfig>,
     pub scraper: ScraperConfig,
     pub telegram: TelegramConfig,
     pub monitoring: MonitoringConfig,
 }
 
+impl AppConfig {
+    /// Returns the database URL, preferring config then DATABASE_URL env var.
+    pub fn database_url(&self) -> Option<String> {
+        if let Some(ref db) = self.database {
+            if !db.url.is_empty() {
+                return Some(db.url.clone());
+            }
+        }
+        std::env::var("DATABASE_URL").ok()
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct ScraperConfig {
-    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
-    pub keywords: Vec<String>,
-    pub marketplace_url: String,
     pub brand_filter: String,
     #[serde(default = "default_pages")]
     pub pages: u32,
     #[serde(default)]
     pub chrome_executable: Option<String>,
+    pub marketplaces: Vec<MarketplaceConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct MarketplaceConfig {
+    pub code: String,
+    pub url: String,
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub keywords: Vec<String>,
+    pub accept_language: String,
+    pub languages: Vec<String>,
 }
 
 fn default_pages() -> u32 {
@@ -43,16 +65,39 @@ pub fn load_config() -> Result<AppConfig> {
     if app_config.telegram.chat_id == 0 {
         bail!("telegram.chat_id must be set (got 0). See README for how to find your chat ID.");
     }
-    if app_config.scraper.keywords.is_empty() {
-        bail!("scraper.keywords must contain at least one keyword.");
+    if app_config.scraper.marketplaces.is_empty() {
+        bail!("scraper.marketplaces must contain at least one marketplace.");
     }
-    for kw in &app_config.scraper.keywords {
-        if kw.trim().is_empty() {
-            bail!("scraper.keywords must not contain empty or whitespace-only entries.");
+    for mp in &app_config.scraper.marketplaces {
+        if mp.code.is_empty() {
+            bail!("Each marketplace must have a non-empty code.");
         }
-    }
-    if app_config.scraper.marketplace_url.is_empty() {
-        bail!("scraper.marketplace_url must not be empty.");
+        if mp.url.is_empty() {
+            bail!("Marketplace '{}': url must not be empty.", mp.code);
+        }
+        if mp.keywords.is_empty() {
+            bail!(
+                "Marketplace '{}': keywords must contain at least one keyword.",
+                mp.code
+            );
+        }
+        for kw in &mp.keywords {
+            if kw.trim().is_empty() {
+                bail!(
+                    "Marketplace '{}': keywords must not contain empty or whitespace-only entries.",
+                    mp.code
+                );
+            }
+        }
+        if mp.accept_language.is_empty() {
+            bail!(
+                "Marketplace '{}': accept_language must not be empty.",
+                mp.code
+            );
+        }
+        if mp.languages.is_empty() {
+            bail!("Marketplace '{}': languages must not be empty.", mp.code);
+        }
     }
     if app_config.scraper.brand_filter.is_empty() {
         bail!("scraper.brand_filter must not be empty.");
@@ -101,7 +146,10 @@ where
             }
         }
 
-        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+        fn visit_seq<A: SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
             let mut vec = Vec::new();
             while let Some(val) = seq.next_element()? {
                 vec.push(val);

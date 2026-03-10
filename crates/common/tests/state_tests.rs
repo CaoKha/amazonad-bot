@@ -46,8 +46,15 @@ fn missing_file() {
 fn unknown_keyword_defaults() {
     // An absent keyword key should yield brand_ad_visible=false via unwrap_or_default
     let state = MonitorState::default();
-    let kw_state = state.keywords.get("montre connectee").cloned().unwrap_or_default();
-    assert!(!kw_state.brand_ad_visible, "Unknown keyword should default to not visible");
+    let kw_state = state
+        .keywords
+        .get("montre connectee")
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !kw_state.brand_ad_visible,
+        "Unknown keyword should default to not visible"
+    );
     assert!(kw_state.brand_positions.is_empty());
     assert!(kw_state.last_results.is_empty());
 }

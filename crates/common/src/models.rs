@@ -49,7 +49,6 @@ impl fmt::Display for BadgeType {
     }
 }
 
-
 /// A single product from amazon.fr search results.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SearchResult {
