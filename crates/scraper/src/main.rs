@@ -104,12 +104,17 @@ async fn cmd_run() -> anyhow::Result<()> {
         shutdown_flag.clone(),
     ));
 
-    // Bot uses first marketplace's keywords and URL for on-demand commands
-    let first_mp = config
+    // Bot uses all marketplaces' keywords and URLs for on-demand commands
+    let bot_marketplaces: Vec<bot::BotMarketplace> = config
         .scraper
         .marketplaces
-        .first()
-        .expect("at least one marketplace required (validated in load_config)");
+        .iter()
+        .map(|mp| bot::BotMarketplace {
+            code: mp.code.clone(),
+            url: mp.url.clone(),
+            keywords: mp.keywords.clone(),
+        })
+        .collect();
     let first_tg = &config.telegram[0];
     let bot_token = std::env::var(&first_tg.bot_token_env)
         .unwrap_or_else(|_| panic!("{} must be set", first_tg.bot_token_env));
@@ -119,8 +124,7 @@ async fn cmd_run() -> anyhow::Result<()> {
         scraper.clone(),
         state_manager.clone(),
         config.scraper.brand_filter.clone(),
-        first_mp.keywords.clone(),
-        first_mp.url.clone(),
+        bot_marketplaces,
     );
     tokio::spawn(async move { listener.run().await });
 

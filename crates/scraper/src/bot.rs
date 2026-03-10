@@ -34,6 +34,12 @@ struct Chat {
     id: i64,
 }
 
+pub struct BotMarketplace {
+    pub code: String,
+    pub url: String,
+    pub keywords: Vec<String>,
+}
+
 pub struct CommandListener {
     client: reqwest::Client,
     bot_token: String,
@@ -42,8 +48,7 @@ pub struct CommandListener {
     scraper: Arc<AmazonScraper>,
     state_manager: Arc<StateManager>,
     brand_filter: String,
-    keywords: Vec<String>,
-    marketplace_url: String,
+    marketplaces: Vec<BotMarketplace>,
 }
 
 impl CommandListener {
@@ -53,8 +58,7 @@ impl CommandListener {
         scraper: Arc<AmazonScraper>,
         state_manager: Arc<StateManager>,
         brand_filter: String,
-        keywords: Vec<String>,
-        marketplace_url: String,
+        marketplaces: Vec<BotMarketplace>,
     ) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -63,8 +67,7 @@ impl CommandListener {
             scraper,
             state_manager,
             brand_filter,
-            keywords,
-            marketplace_url,
+            marketplaces,
         }
     }
 
@@ -140,26 +143,32 @@ impl CommandListener {
     }
 
     async fn handle_start(&self) {
-        let mut keyword_lines = String::new();
-        for kw in &self.keywords {
-            let url = AmazonScraper::build_search_url(&self.marketplace_url, kw, 1);
-            let url_escaped = escape_html(&url);
-            keyword_lines.push_str(&format!(
-                "• <code>{}</code> → <a href=\"{url_escaped}\">{url_escaped}</a>\n",
-                escape_html(kw)
-            ));
+        let total_keywords: usize = self.marketplaces.iter().map(|m| m.keywords.len()).sum();
+        let mut text = format!(
+            "🔍 <b>amazonad-bot</b>\n\nMonitoring {} keyword(s):\n",
+            total_keywords
+        );
+
+        for mp in &self.marketplaces {
+            text.push_str(&format!("\n<b>[{}]</b>\n", escape_html(&mp.code)));
+            for kw in &mp.keywords {
+                let url = AmazonScraper::build_search_url(&mp.url, kw, 1);
+                let url_escaped = escape_html(&url);
+                text.push_str(&format!(
+                    "• <code>{}</code> → <a href=\"{url_escaped}\">{url_escaped}</a>\n",
+                    escape_html(kw)
+                ));
+            }
         }
-        let text = format!(
-            "🔍 <b>amazonad-bot</b>\n\n\
-             Monitoring {} keyword(s):\n{}\n\
-             Commands:\n\
+
+        text.push_str(
+            "\nCommands:\n\
              /status — current monitoring state\n\
              /check — show cached last-sweep results\n\
              /list — all sponsored products from cache\n\
              /filter &lt;brand&gt; — filter by brand name",
-            self.keywords.len(),
-            keyword_lines.trim_end(),
         );
+
         self.send_reply(&text).await;
     }
 
@@ -178,36 +187,41 @@ impl CommandListener {
             }
         };
 
+        let total_keywords: usize = self.marketplaces.iter().map(|m| m.keywords.len()).sum();
         let mut lines = Vec::new();
         let mut last_check: Option<chrono::DateTime<chrono::Utc>> = None;
 
-        for kw in &self.keywords {
-            let ks = state.keywords.get(kw.as_str());
-            match ks {
-                Some(ks) => {
-                    if let Some(lc) = ks.last_checked {
-                        last_check = Some(
-                            last_check
-                                .map_or(lc, |prev: chrono::DateTime<chrono::Utc>| prev.max(lc)),
-                        );
+        for mp in &self.marketplaces {
+            lines.push(format!("\n<b>[{}]</b>", escape_html(&mp.code)));
+            for kw in &mp.keywords {
+                let state_key = format!("{}:{}", mp.code, kw);
+                let ks = state.keywords.get(state_key.as_str());
+                match ks {
+                    Some(ks) => {
+                        if let Some(lc) = ks.last_checked {
+                            last_check = Some(
+                                last_check
+                                    .map_or(lc, |prev: chrono::DateTime<chrono::Utc>| prev.max(lc)),
+                            );
+                        }
+                        let vis = if ks.brand_ad_visible {
+                            "✅ visible"
+                        } else {
+                            "❌ not visible"
+                        };
+                        lines.push(format!(
+                            "• <code>{}</code>: {} {}",
+                            escape_html(kw),
+                            escape_html(&self.brand_filter),
+                            vis
+                        ));
                     }
-                    let vis = if ks.brand_ad_visible {
-                        "✅ visible"
-                    } else {
-                        "❌ not visible"
-                    };
-                    lines.push(format!(
-                        "• <code>{}</code>: {} {}",
-                        escape_html(kw),
-                        escape_html(&self.brand_filter),
-                        vis
-                    ));
-                }
-                None => {
-                    lines.push(format!(
-                        "• <code>{}</code>: not yet checked",
-                        escape_html(kw)
-                    ));
+                    None => {
+                        lines.push(format!(
+                            "• <code>{}</code>: not yet checked",
+                            escape_html(kw)
+                        ));
+                    }
                 }
             }
         }
@@ -217,8 +231,8 @@ impl CommandListener {
             .unwrap_or_else(|| "never".to_string());
 
         let text = format!(
-            "⚙️ <b>Monitoring {} keyword(s)</b>\nLast sweep: {}\n\n{}",
-            self.keywords.len(),
+            "⚙️ <b>Monitoring {} keyword(s)</b>\nLast sweep: {}\n{}",
+            total_keywords,
             last_str,
             lines.join("\n"),
         );
@@ -242,58 +256,62 @@ impl CommandListener {
 
         let mut lines = Vec::new();
 
-        for kw in &self.keywords {
-            match state.keywords.get(kw.as_str()) {
-                Some(ks) => {
-                    let time_str = ks
-                        .last_checked
-                        .map(|t| format!("checked {}", t.format("%H:%M")))
-                        .unwrap_or_else(|| "not yet checked".to_string());
+        for mp in &self.marketplaces {
+            lines.push(format!("\n<b>[{}]</b>", escape_html(&mp.code)));
+            for kw in &mp.keywords {
+                let state_key = format!("{}:{}", mp.code, kw);
+                match state.keywords.get(state_key.as_str()) {
+                    Some(ks) => {
+                        let time_str = ks
+                            .last_checked
+                            .map(|t| format!("checked {}", t.format("%H:%M")))
+                            .unwrap_or_else(|| "not yet checked".to_string());
 
-                    if ks.brand_ad_visible {
-                        let pos_str = ks
-                            .brand_positions
-                            .iter()
-                            .map(|(page, pos, pt)| {
-                                let loc = if *pos == 0 {
-                                    format!("Page {} Carousel", page)
-                                } else {
-                                    format!("Page {} #{}", page, pos)
-                                };
-                                if let Some(pt) = pt {
-                                    format!("{loc} [{pt}]")
-                                } else {
-                                    loc
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .join(", ");
+                        if ks.brand_ad_visible {
+                            let pos_str = ks
+                                .brand_positions
+                                .iter()
+                                .map(|(page, pos, pt)| {
+                                    let loc = if *pos == 0 {
+                                        format!("Page {} Carousel", page)
+                                    } else {
+                                        format!("Page {} #{}", page, pos)
+                                    };
+                                    if let Some(pt) = pt {
+                                        format!("{loc} [{pt}]")
+                                    } else {
+                                        loc
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            lines.push(format!(
+                                "• <code>{}</code>: {} ✅ {} ({})",
+                                escape_html(kw),
+                                escape_html(&self.brand_filter),
+                                pos_str,
+                                time_str,
+                            ));
+                        } else {
+                            lines.push(format!(
+                                "• <code>{}</code>: {} ❌ not visible ({})",
+                                escape_html(kw),
+                                escape_html(&self.brand_filter),
+                                time_str,
+                            ));
+                        }
+                    }
+                    None => {
                         lines.push(format!(
-                            "• <code>{}</code>: {} ✅ {} ({})",
-                            escape_html(kw),
-                            escape_html(&self.brand_filter),
-                            pos_str,
-                            time_str,
-                        ));
-                    } else {
-                        lines.push(format!(
-                            "• <code>{}</code>: {} ❌ not visible ({})",
-                            escape_html(kw),
-                            escape_html(&self.brand_filter),
-                            time_str,
+                            "• <code>{}</code>: not yet checked",
+                            escape_html(kw)
                         ));
                     }
-                }
-                None => {
-                    lines.push(format!(
-                        "• <code>{}</code>: not yet checked",
-                        escape_html(kw)
-                    ));
                 }
             }
         }
 
-        let text = format!("📊 <b>Last sweep results:</b>\n\n{}", lines.join("\n"));
+        let text = format!("📊 <b>Last sweep results:</b>\n{}", lines.join("\n"));
         self.send_reply(&text).await;
     }
 
@@ -312,55 +330,62 @@ impl CommandListener {
             }
         };
 
+        let total_keywords: usize = self.marketplaces.iter().map(|m| m.keywords.len()).sum();
         let mut text = String::from("📋 <b>All sponsored products (cached):</b>\n");
         let mut total = 0usize;
 
-        for kw in &self.keywords {
-            match state.keywords.get(kw.as_str()) {
-                Some(ks) => {
-                    let sponsored: Vec<_> =
-                        ks.last_results.iter().filter(|r| r.is_sponsored).collect();
-                    if sponsored.is_empty() {
-                        text.push_str(&format!(
-                            "\n<b>{}</b>: no sponsored products\n",
-                            escape_html(kw)
-                        ));
-                    } else {
-                        text.push_str(&format!(
-                            "\n<b>{}</b> ({} sponsored):\n",
-                            escape_html(kw),
-                            sponsored.len()
-                        ));
-                        for r in sponsored.iter().take(15) {
-                            let loc = if r.position_in_page == 0 {
-                                format!("Page {} Carousel", r.page)
-                            } else {
-                                format!("Page {} #{}", r.page, r.position_in_page)
-                            };
-                            let tag = r
-                                .placement_type
-                                .as_ref()
-                                .map(|t| format!(" [{t}]"))
-                                .unwrap_or_default();
-                            text.push_str(&format!("• {loc}{tag} — {}\n", escape_html(&r.title)));
+        for mp in &self.marketplaces {
+            text.push_str(&format!("\n<b>[{}]</b>\n", escape_html(&mp.code)));
+            for kw in &mp.keywords {
+                let state_key = format!("{}:{}", mp.code, kw);
+                match state.keywords.get(state_key.as_str()) {
+                    Some(ks) => {
+                        let sponsored: Vec<_> =
+                            ks.last_results.iter().filter(|r| r.is_sponsored).collect();
+                        if sponsored.is_empty() {
+                            text.push_str(&format!(
+                                "\n<b>{}</b>: no sponsored products\n",
+                                escape_html(kw)
+                            ));
+                        } else {
+                            text.push_str(&format!(
+                                "\n<b>{}</b> ({} sponsored):\n",
+                                escape_html(kw),
+                                sponsored.len()
+                            ));
+                            for r in sponsored.iter().take(15) {
+                                let loc = if r.position_in_page == 0 {
+                                    format!("Page {} Carousel", r.page)
+                                } else {
+                                    format!("Page {} #{}", r.page, r.position_in_page)
+                                };
+                                let tag = r
+                                    .placement_type
+                                    .as_ref()
+                                    .map(|t| format!(" [{t}]"))
+                                    .unwrap_or_default();
+                                text.push_str(&format!(
+                                    "• {loc}{tag} — {}\n",
+                                    escape_html(&r.title)
+                                ));
+                            }
+                            let remaining = sponsored.len().saturating_sub(15);
+                            if remaining > 0 {
+                                text.push_str(&format!("... and {} more\n", remaining));
+                            }
+                            total += sponsored.len();
                         }
-                        let remaining = sponsored.len().saturating_sub(15);
-                        if remaining > 0 {
-                            text.push_str(&format!("... and {} more\n", remaining));
-                        }
-                        total += sponsored.len();
                     }
-                }
-                None => {
-                    text.push_str(&format!("\n<b>{}</b>: not yet checked\n", escape_html(kw)));
+                    None => {
+                        text.push_str(&format!("\n<b>{}</b>: not yet checked\n", escape_html(kw)));
+                    }
                 }
             }
         }
 
         text.push_str(&format!(
             "\n<i>Total: {} sponsored across {} keywords</i>",
-            total,
-            self.keywords.len()
+            total, total_keywords
         ));
         self.send_reply(text.trim()).await;
     }
@@ -401,29 +426,41 @@ impl CommandListener {
         );
         let mut total = 0usize;
 
-        for kw in &self.keywords {
-            if let Some(ks) = state.keywords.get(kw.as_str()) {
-                let matched: Vec<_> = ks
-                    .last_results
-                    .iter()
-                    .filter(|r| r.is_sponsored && r.title.to_lowercase().contains(&filter_lower))
-                    .collect();
-                if !matched.is_empty() {
-                    text.push_str(&format!("\n<b>{}</b>:\n", escape_html(kw)));
-                    for r in matched.iter().take(10) {
-                        let loc = if r.position_in_page == 0 {
-                            format!("Page {} Carousel", r.page)
-                        } else {
-                            format!("Page {} #{}", r.page, r.position_in_page)
-                        };
-                        let tag = r
-                            .placement_type
-                            .as_ref()
-                            .map(|t| format!(" [{t}]"))
-                            .unwrap_or_default();
-                        text.push_str(&format!("• {loc}{tag} — {}\n", escape_html(&r.title)));
+        for mp in &self.marketplaces {
+            let mut mp_lines = Vec::new();
+            for kw in &mp.keywords {
+                let state_key = format!("{}:{}", mp.code, kw);
+                if let Some(ks) = state.keywords.get(state_key.as_str()) {
+                    let matched: Vec<_> = ks
+                        .last_results
+                        .iter()
+                        .filter(|r| {
+                            r.is_sponsored && r.title.to_lowercase().contains(&filter_lower)
+                        })
+                        .collect();
+                    if !matched.is_empty() {
+                        mp_lines.push(format!("\n<b>{}</b>:\n", escape_html(kw)));
+                        for r in matched.iter().take(10) {
+                            let loc = if r.position_in_page == 0 {
+                                format!("Page {} Carousel", r.page)
+                            } else {
+                                format!("Page {} #{}", r.page, r.position_in_page)
+                            };
+                            let tag = r
+                                .placement_type
+                                .as_ref()
+                                .map(|t| format!(" [{t}]"))
+                                .unwrap_or_default();
+                            mp_lines.push(format!("• {loc}{tag} — {}\n", escape_html(&r.title)));
+                        }
+                        total += matched.len();
                     }
-                    total += matched.len();
+                }
+            }
+            if !mp_lines.is_empty() {
+                text.push_str(&format!("\n<b>[{}]</b>", escape_html(&mp.code)));
+                for line in mp_lines {
+                    text.push_str(&line);
                 }
             }
         }
