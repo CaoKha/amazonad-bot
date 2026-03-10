@@ -356,9 +356,59 @@ impl AmazonScraper {
             LazyLock::new(|| Selector::parse("i.a-icon-prime").unwrap());
         static BADGE_SEL: LazyLock<Selector> =
             LazyLock::new(|| Selector::parse("span.a-badge-text").unwrap());
-        static BRAND_SEL: LazyLock<Selector> =
-            LazyLock::new(|| Selector::parse("span.a-size-base.a-color-secondary").unwrap());
+        // Brand selectors — tried in cascade order (most reliable first).
+        // The old selector (span.a-size-base.a-color-secondary) was too broad
+        // and matched price labels, popularity badges, and other UI metadata.
+        static BRAND_SEL_1: LazyLock<Selector> =
+            LazyLock::new(|| Selector::parse(".a-row .a-size-base-plus.a-color-base").unwrap());
+        static BRAND_SEL_2: LazyLock<Selector> =
+            LazyLock::new(|| Selector::parse("h5.s-line-clamp-1 span").unwrap());
+        static BRAND_SEL_3: LazyLock<Selector> =
+            LazyLock::new(|| Selector::parse(".s-line-clamp-1 .a-size-base-plus").unwrap());
+        static BRAND_SEL_4: LazyLock<Selector> =
+            LazyLock::new(|| Selector::parse("span.a-size-base-plus.a-color-base").unwrap());
         static LINK_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("a[href]").unwrap());
+
+        // Validates that a brand string looks like a real brand name, not UI garbage.
+        fn is_plausible_brand(s: &str) -> bool {
+            if s.len() > 80 {
+                return false;
+            }
+            if s.ends_with(':') {
+                return false;
+            }
+            let lower = s.to_lowercase();
+            let garbage_patterns = [
+                "bought in past",
+                "comprado",
+                "gekauft",
+                "el mes pasado",
+                "im letzten monat",
+                "opciones de compra",
+                "buying choice",
+                "offers available",
+                "ofertas destacadas",
+                "andere angebote",
+                "small business",
+                "peque\u{f1}as empresas",
+                "alexa integrada",
+                "nuevo en amazon",
+                "neu auf amazon",
+                "new on amazon",
+                "angebote verf\u{fc}gbar",
+                "einstufung",
+            ];
+            if garbage_patterns.iter().any(|p| lower.contains(p)) {
+                return false;
+            }
+            // Reject price-per-unit patterns like "(€2.50/count)"
+            if s.starts_with('(')
+                && (s.contains('\u{20ac}') || s.contains('\u{00a3}') || s.contains('$'))
+            {
+                return false;
+            }
+            true
+        }
 
         let document = Html::parse_document(html);
         let brand_lower = brand_filter.to_lowercase();
@@ -461,11 +511,15 @@ impl AmazonScraper {
                 }
             });
 
-            let brand = element
-                .select(&BRAND_SEL)
-                .next()
-                .map(|el| el.text().collect::<String>().trim().to_string())
-                .filter(|s| !s.is_empty());
+            let brand = [&*BRAND_SEL_1, &*BRAND_SEL_2, &*BRAND_SEL_3, &*BRAND_SEL_4]
+                .iter()
+                .find_map(|sel| {
+                    element
+                        .select(sel)
+                        .next()
+                        .map(|el| el.text().collect::<String>().trim().to_string())
+                        .filter(|s| !s.is_empty() && is_plausible_brand(s))
+                });
 
             if pos_in_page <= 5 {
                 info!(

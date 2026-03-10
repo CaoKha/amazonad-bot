@@ -1,5 +1,6 @@
-/target
+target/
 .env
 state.json
 config.toml
 .sisyphus/
+dist/

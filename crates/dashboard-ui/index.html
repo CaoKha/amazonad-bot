@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MTS Ad Monitor</title>
+    <link data-trunk rel="rust" data-wasm-opt="z" />
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        // ECharts helper: init or update a chart by DOM id
+        window.mts_update_chart = function(id, optionJson) {
+            if (!window.__mts_charts) window.__mts_charts = {};
+            var el = document.getElementById(id);
+            if (!el) return;
+            // Dispose stale instance if the DOM element was recreated
+            if (window.__mts_charts[id]) {
+                try {
+                    var oldDom = window.__mts_charts[id].getDom();
+                    if (oldDom !== el) {
+                        window.__mts_charts[id].dispose();
+                        window.__mts_charts[id] = null;
+                    }
+                } catch(e) {
+                    window.__mts_charts[id] = null;
+                }
+            }
+            if (!window.__mts_charts[id]) {
+                window.__mts_charts[id] = echarts.init(el);
+            }
+            window.__mts_charts[id].setOption(JSON.parse(optionJson), {notMerge: true});
+        };
+    </script>
+</head>
+<body></body>
+</html>
