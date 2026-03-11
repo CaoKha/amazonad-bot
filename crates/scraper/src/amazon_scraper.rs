@@ -782,7 +782,7 @@ impl AmazonScraper {
             info!(
                 "  brand_match: asin={} title={:?} brand={:?} placement={:?}",
                 r.asin,
-                &r.title[..r.title.len().min(60)],
+                &r.title[..r.title.char_indices().nth(60).map(|(i, _)| i).unwrap_or(r.title.len())],
                 r.brand.as_deref().unwrap_or("-"),
                 r.placement_type
             );
